@@ -29,12 +29,22 @@
 #include "hardware/sync.h"
 #include "pico/stdlib.h"
 
-// This implementation does Not support Flash sector caching.
-#if MICROPY_FATFS_MAX_SS != FLASH_SECTOR_SIZE
-#error MICROPY_FATFS_MAX_SS must be the same size as FLASH_SECTOR_SIZE
-#endif
-
-#define BLOCK_SIZE          (FLASH_SECTOR_SIZE)
+/* ThumbyOne slot mode: expose 512-byte logical sectors to USB MSC
+ * so the host sees the same drive layout as NES/P8/lobby (single
+ * canonical on-disk format across every slot). Writes that don't
+ * cover a full 4 KB flash erase block go through read-modify-
+ * erase-program using a static 4 KB buffer.
+ *
+ * BLOCK_SIZE is the LOGICAL block reported to the host via SCSI
+ * READ_CAPACITY; FLASH_ERASE_SIZE is the underlying flash erase
+ * granularity. Older mp-thumby msc_disk.c assumed these were equal
+ * and wrote full 4 KB erase blocks per READ/WRITE — that forced
+ * MSC to expose 4 KB sectors, which mismatches the shared-FAT
+ * 512-byte format and made Windows prompt "drive needs formatting"
+ * on every MPY boot. */
+#define BLOCK_SIZE          (512u)
+#define FLASH_ERASE_SIZE    (FLASH_SECTOR_SIZE)   /* 4096 */
+#define SECTORS_PER_ERASE   (FLASH_ERASE_SIZE / BLOCK_SIZE)
 #define BLOCK_COUNT         (MICROPY_HW_FLASH_STORAGE_BYTES / BLOCK_SIZE)
 #define FLASH_BASE_ADDR     (PICO_FLASH_SIZE_BYTES - MICROPY_HW_FLASH_STORAGE_BYTES)
 #define FLASH_MMAP_ADDR     (XIP_BASE + FLASH_BASE_ADDR)
@@ -85,20 +95,59 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, boo
 // Callback invoked when received READ10 command.
 // Copy disk's data to buffer (up to bufsize) and return number of copied bytes.
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
-    uint32_t count = bufsize / BLOCK_SIZE;
-    memcpy(buffer, (void *)(FLASH_MMAP_ADDR + lba * BLOCK_SIZE), count * BLOCK_SIZE);
-    return count * BLOCK_SIZE;
+    /* XIP-map read works for any byte-aligned range. `offset` is
+     * usually 0 (whole-sector reads), but non-zero partial reads
+     * are also valid per SCSI READ(10). */
+    memcpy(buffer,
+           (void *)(FLASH_MMAP_ADDR + lba * BLOCK_SIZE + offset),
+           bufsize);
+    return (int32_t)bufsize;
 }
+
+/* 4 KB read-modify-erase-program buffer for sub-erase-size MSC
+ * writes. Static: caller frames are small and MSC may write a few
+ * sectors at a time during host-initiated file copies. See also
+ * rp2_flash.c's s_rmw_buf — same idea. */
+static uint8_t s_msc_rmw_buf[FLASH_ERASE_SIZE];
 
 // Callback invoked when received WRITE10 command.
 // Process data in buffer to disk's storage and return number of written bytes
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) {
-    uint32_t count = bufsize / BLOCK_SIZE;
-    uint32_t ints = save_and_disable_interrupts();
-    flash_range_erase(FLASH_BASE_ADDR + lba * BLOCK_SIZE, count * BLOCK_SIZE);
-    flash_range_program(FLASH_BASE_ADDR + lba * BLOCK_SIZE, buffer, count * BLOCK_SIZE);
-    restore_interrupts(ints);
-    return count * BLOCK_SIZE;
+    uint32_t abs_offset = lba * BLOCK_SIZE + offset;
+    const uint8_t *src = buffer;
+    uint32_t remaining = bufsize;
+
+    while (remaining > 0) {
+        uint32_t block_addr    = FLASH_BASE_ADDR
+                               + (abs_offset / FLASH_ERASE_SIZE) * FLASH_ERASE_SIZE;
+        uint32_t offset_in_blk = abs_offset % FLASH_ERASE_SIZE;
+        uint32_t space_in_blk  = FLASH_ERASE_SIZE - offset_in_blk;
+        uint32_t chunk         = (remaining < space_in_blk) ? remaining : space_in_blk;
+
+        const uint8_t *prog_src = src;
+        uint32_t prog_len = chunk;
+        uint32_t prog_offset = offset_in_blk;
+        if (!(offset_in_blk == 0 && chunk == FLASH_ERASE_SIZE)) {
+            /* Partial 4 KB block: preserve the untouched bytes via
+             * the XIP mapping before we erase. */
+            memcpy(s_msc_rmw_buf,
+                   (const void *)(XIP_BASE + block_addr),
+                   FLASH_ERASE_SIZE);
+            memcpy(s_msc_rmw_buf + offset_in_blk, src, chunk);
+            prog_src = s_msc_rmw_buf;
+            prog_len = FLASH_ERASE_SIZE;
+            prog_offset = 0;
+        }
+        uint32_t ints = save_and_disable_interrupts();
+        flash_range_erase(block_addr, FLASH_ERASE_SIZE);
+        flash_range_program(block_addr + prog_offset, prog_src, prog_len);
+        restore_interrupts(ints);
+
+        abs_offset += chunk;
+        src        += chunk;
+        remaining  -= chunk;
+    }
+    return (int32_t)bufsize;
 }
 
 // Callback invoked when received an SCSI command not in built-in list below

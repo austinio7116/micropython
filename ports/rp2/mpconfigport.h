@@ -182,9 +182,17 @@
 #if MICROPY_HW_USB_MSC
 #define MICROPY_FATFS_USE_LABEL                 (1)
 #define MICROPY_FATFS_MULTI_PARTITION           (1)
-// Set FatFS block size to flash sector size to avoid caching
-// the flash sector in memory to support smaller block sizes.
-#define MICROPY_FATFS_MAX_SS                    (FLASH_SECTOR_SIZE)
+/* ThumbyOne slot mode: rp2.Flash presents 512-byte logical sectors
+ * with a 4 KB read-modify-write buffer hiding the flash erase
+ * granularity. That matches ThumbyNES/P8/lobby's native sector
+ * size so the shared FAT at physical 0x660000 has one canonical
+ * on-disk format across every slot. FF_MAX_SS stays at FF_MIN_SS
+ * (512) so FatFs runs in fixed-sector mode with a smaller FATFS
+ * struct (no ssize field), identical shape to what NES/P8 use.
+ *
+ * This macro also feeds tusb_config.h's CFG_TUD_MSC_BUFSIZE — kept
+ * at 512 so the USB MSC endpoint buffer matches our logical sector. */
+#define MICROPY_FATFS_MAX_SS                    (512)
 #endif
 
 #ifndef MICROPY_BOARD_ENTER_BOOTLOADER

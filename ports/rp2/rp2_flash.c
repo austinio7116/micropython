@@ -33,7 +33,28 @@
 #include "hardware/flash.h"
 #include "pico/binary_info.h"
 
-#define BLOCK_SIZE_BYTES (FLASH_SECTOR_SIZE)
+/* LOGICAL_BLOCK_SIZE is what we report to MicroPython's block-device
+ * layer and, via vfs_fat_diskio's GET_SECTOR_SIZE, what FatFs sees.
+ *
+ * 512 bytes matches ThumbyNES / ThumbyP8 / lobby conventions so the
+ * shared FAT at physical flash 0x660000 has ONE canonical on-disk
+ * format across every slot — lobby's 512-byte-sector FAT16 mount
+ * parses cleanly from MPY too, which was the C2c follow-up.
+ *
+ * FLASH_ERASE_BLOCK is the underlying flash granularity (4 KB). Writes
+ * that don't cover a full 4 KB erase block go through a read-modify-
+ * erase-program path using a static RAM buffer.
+ *
+ * KEEP_BLOCK_SIZE_BYTES is the granularity we still require for
+ * partition alignment when constructing a sub-range rp2.Flash — users
+ * pass `start` and `len` that refer to flash regions, not to logical
+ * sectors, so those need to stay 4 KB aligned (one erase block). */
+#define LOGICAL_BLOCK_SIZE    512u
+#define FLASH_ERASE_BLOCK     FLASH_SECTOR_SIZE        /* 4096 */
+#define SECTORS_PER_ERASE     (FLASH_ERASE_BLOCK / LOGICAL_BLOCK_SIZE)
+#define BLOCK_SIZE_BYTES      FLASH_ERASE_BLOCK        /* legacy alias for the
+                                                         partition-alignment
+                                                         checks in make_new */
 
 #ifndef MICROPY_HW_FLASH_STORAGE_BYTES
 #define MICROPY_HW_FLASH_STORAGE_BYTES (1408 * 1024)
@@ -157,7 +178,8 @@ static mp_obj_t rp2_flash_make_new(const mp_obj_type_t *type, size_t n_args, siz
 
 static mp_obj_t rp2_flash_readblocks(size_t n_args, const mp_obj_t *args) {
     rp2_flash_obj_t *self = MP_OBJ_TO_PTR(args[0]);
-    uint32_t offset = mp_obj_get_int(args[1]) * BLOCK_SIZE_BYTES;
+    /* block_num is in LOGICAL_BLOCK_SIZE units (512 bytes). */
+    uint32_t offset = mp_obj_get_int(args[1]) * LOGICAL_BLOCK_SIZE;
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(args[2], &bufinfo, MP_BUFFER_WRITE);
     if (n_args == 4) {
@@ -172,25 +194,81 @@ static mp_obj_t rp2_flash_readblocks(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(rp2_flash_readblocks_obj, 3, 4, rp2_flash_readblocks);
 
+/* Read-modify-erase-program buffer for sub-erase-size writes. One
+ * erase block's worth. Static because a 4 KB stack frame would push
+ * the MP runtime close to its limits on some call paths. Single-
+ * threaded access is enforced by begin_critical_flash_section
+ * locking core 1 out, so no synchronisation needed here. */
+static uint8_t s_rmw_buf[FLASH_ERASE_BLOCK];
+
+/* Erase + program a single 4 KB flash block, substituting `len`
+ * bytes starting at `offset_in_block` with `src`. If the write
+ * covers the whole block we skip the XIP preload step. */
+static void rmw_one_block(uint32_t flash_block_addr,
+                          uint32_t offset_in_block,
+                          const uint8_t *src,
+                          uint32_t len) {
+    if (!(offset_in_block == 0 && len == FLASH_ERASE_BLOCK)) {
+        /* Preload existing block contents from XIP before we erase.
+         * XIP sees whatever's currently committed to flash — safe
+         * because we are the only writer (critical section gates
+         * concurrent core-1 flash access). */
+        memcpy(s_rmw_buf,
+               (const void *)(XIP_BASE + flash_block_addr),
+               FLASH_ERASE_BLOCK);
+        memcpy(s_rmw_buf + offset_in_block, src, len);
+        src = s_rmw_buf;
+        len = FLASH_ERASE_BLOCK;
+        offset_in_block = 0;
+    }
+    uint32_t atomic_state = begin_critical_flash_section();
+    flash_range_erase(flash_block_addr, FLASH_ERASE_BLOCK);
+    flash_range_program(flash_block_addr + offset_in_block, src, len);
+    end_critical_flash_section(atomic_state);
+}
+
 static mp_obj_t rp2_flash_writeblocks(size_t n_args, const mp_obj_t *args) {
     rp2_flash_obj_t *self = MP_OBJ_TO_PTR(args[0]);
-    uint32_t offset = mp_obj_get_int(args[1]) * BLOCK_SIZE_BYTES;
+    /* block_num is in LOGICAL_BLOCK_SIZE units. */
+    uint32_t offset = mp_obj_get_int(args[1]) * LOGICAL_BLOCK_SIZE;
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(args[2], &bufinfo, MP_BUFFER_READ);
+
     if (n_args == 3) {
-        mp_uint_t atomic_state = begin_critical_flash_section();
-        flash_range_erase(self->flash_base + offset, bufinfo.len);
+        /* 3-arg form: erase-then-program. MicroPython's blockdev
+         * contract says any prior contents of the affected range
+         * are discarded, so for 512-byte logical sectors we need
+         * to walk the range erase-block at a time, preserving the
+         * UNTOUCHED bytes in any partially-overlapped 4 KB block. */
+        const uint8_t *src = bufinfo.buf;
+        uint32_t remaining = bufinfo.len;
+        uint32_t cur_offset = offset;
+        while (remaining > 0) {
+            uint32_t block_addr     = self->flash_base
+                                    + (cur_offset / FLASH_ERASE_BLOCK) * FLASH_ERASE_BLOCK;
+            uint32_t offset_in_blk  = cur_offset % FLASH_ERASE_BLOCK;
+            uint32_t space_in_blk   = FLASH_ERASE_BLOCK - offset_in_blk;
+            uint32_t chunk          = (remaining < space_in_blk) ? remaining : space_in_blk;
+
+            rmw_one_block(block_addr, offset_in_blk, src, chunk);
+
+            cur_offset += chunk;
+            src        += chunk;
+            remaining  -= chunk;
+        }
+        mp_event_handle_nowait();
+    } else {
+        /* 4-arg form: program-only, no erase. Caller guarantees the
+         * target region is already erased (all 0xFF) and wants an
+         * overlay write. flash_range_program supports any offset
+         * that's a multiple of FLASH_PAGE_SIZE (256 bytes); our
+         * 512-byte sectors always satisfy this. */
+        offset += mp_obj_get_int(args[3]);
+        uint32_t atomic_state = begin_critical_flash_section();
+        flash_range_program(self->flash_base + offset, bufinfo.buf, bufinfo.len);
         end_critical_flash_section(atomic_state);
         mp_event_handle_nowait();
-        // TODO check return value
-    } else {
-        offset += mp_obj_get_int(args[3]);
     }
-    mp_uint_t atomic_state = begin_critical_flash_section();
-    flash_range_program(self->flash_base + offset, bufinfo.buf, bufinfo.len);
-    end_critical_flash_section(atomic_state);
-    mp_event_handle_nowait();
-    // TODO check return value
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(rp2_flash_writeblocks_obj, 3, 4, rp2_flash_writeblocks);
@@ -206,13 +284,20 @@ static mp_obj_t rp2_flash_ioctl(mp_obj_t self_in, mp_obj_t cmd_in, mp_obj_t arg_
         case MP_BLOCKDEV_IOCTL_SYNC:
             return MP_OBJ_NEW_SMALL_INT(0);
         case MP_BLOCKDEV_IOCTL_BLOCK_COUNT:
-            return MP_OBJ_NEW_SMALL_INT(self->flash_size / BLOCK_SIZE_BYTES);
+            /* Sector count in LOGICAL_BLOCK_SIZE units. */
+            return MP_OBJ_NEW_SMALL_INT(self->flash_size / LOGICAL_BLOCK_SIZE);
         case MP_BLOCKDEV_IOCTL_BLOCK_SIZE:
-            return MP_OBJ_NEW_SMALL_INT(BLOCK_SIZE_BYTES);
+            /* Logical sector size presented to FatFs and MSC. */
+            return MP_OBJ_NEW_SMALL_INT(LOGICAL_BLOCK_SIZE);
         case MP_BLOCKDEV_IOCTL_BLOCK_ERASE: {
-            uint32_t offset = mp_obj_get_int(arg_in) * BLOCK_SIZE_BYTES;
+            /* Erase the 4 KB flash block containing the addressed
+             * logical sector. `arg_in` is in LOGICAL_BLOCK_SIZE
+             * units; multiply and round down to erase alignment. */
+            uint32_t logical_offset = mp_obj_get_int(arg_in) * LOGICAL_BLOCK_SIZE;
+            uint32_t block_addr = self->flash_base
+                                + (logical_offset / FLASH_ERASE_BLOCK) * FLASH_ERASE_BLOCK;
             mp_uint_t atomic_state = begin_critical_flash_section();
-            flash_range_erase(self->flash_base + offset, BLOCK_SIZE_BYTES);
+            flash_range_erase(block_addr, FLASH_ERASE_BLOCK);
             end_critical_flash_section(atomic_state);
             // TODO check return value
             return MP_OBJ_NEW_SMALL_INT(0);
