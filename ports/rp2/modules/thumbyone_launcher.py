@@ -16,36 +16,62 @@
 # was the first-boot "no games" splash, or a previous game run
 # deleted it to force the picker next reboot), fall through to
 # the normal MicroPython REPL path.
+#
+# Diagnostic trail: every stage writes a short marker into
+# /.launch_trace.txt before it runs. If a launch hangs, the user
+# can return to the lobby, USB-mount the drive, and see exactly
+# which stage never completed. /.last_error.txt still captures
+# full exception tracebacks on crashes.
 
 import os
 import sys
 
 
+_TRACE_PATH = "/.launch_trace.txt"
+
+
+def _trace(msg):
+    try:
+        with open(_TRACE_PATH, "a") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+
 def _run_active_game():
+    # First stage — wipe any previous trace so the file only contains
+    # the current launch attempt.
+    try:
+        with open(_TRACE_PATH, "w") as f:
+            f.write("launcher start\n")
+    except Exception:
+        pass
+
     try:
         with open("/.active_game") as f:
             game_dir = f.read().strip()
     except OSError:
-        return  # no active game — REPL
+        _trace("no /.active_game — falling through to REPL")
+        return
 
     if not game_dir:
+        _trace("/.active_game was empty")
         return
+
+    _trace("game_dir = " + game_dir)
 
     main_path = game_dir + "/main.py"
     try:
         with open(main_path) as f:
             code = f.read()
     except OSError:
-        # Path in /.active_game no longer points at a real game.
+        _trace("FAILED: could not read " + main_path)
         return
+    _trace("read main.py (" + str(len(code)) + " bytes)")
 
-    # Add game dir to sys.path for `import` inside the game.
     if game_dir not in sys.path:
         sys.path.insert(0, game_dir)
 
-    # chdir into the game dir so relative paths (e.g.
-    # `TextureResource("sprite.bmp")`) resolve against the game's
-    # own folder — this matches engine/filesystem/main.py's flow.
     original_cwd = None
     try:
         original_cwd = os.getcwd()
@@ -54,39 +80,37 @@ def _run_active_game():
     try:
         os.chdir(game_dir)
     except OSError:
-        pass
+        _trace("WARN: chdir failed")
+    _trace("chdir done")
 
-    # Give engine_save a per-game saves directory under /Saves.
-    # Mirrors the engine launcher: each game gets its own namespace
-    # so that `engine_save.save("foo", x)` writes under /Saves/<name>.
     try:
         import engine_save
         engine_save._init_saves_dir("/Saves" + game_dir)
     except Exception:
         pass
+    _trace("engine_save init done")
 
     g = {"__name__": "__main__", "__file__": main_path}
+    _trace("about to exec")
     try:
         exec(code, g)
+        _trace("exec returned normally")
     except Exception as e:
-        # Game crashed — capture the traceback to /.last_error.txt
-        # so the user can inspect it via USB MSC after reboot. Also
-        # print to CDC in case a serial terminal is attached.
         sys.print_exception(e)
         try:
             import io
             buf = io.StringIO()
             buf.write("Game crash: " + main_path + "\n")
             sys.print_exception(e, buf)
-            # Restore cwd before writing so the path is absolute.
             try:
                 os.chdir("/")
             except OSError:
                 pass
             with open("/.last_error.txt", "w") as ef:
                 ef.write(buf.getvalue())
+            _trace("wrote /.last_error.txt")
         except Exception:
-            pass
+            _trace("FAILED: could not write /.last_error.txt")
     finally:
         if original_cwd is not None:
             try:
