@@ -609,17 +609,109 @@ endif()
 # ThumbyOne slot-mode integration (additive, conditional).
 #
 # When the parent ThumbyOne build invokes this CMakeLists with
-# THUMBYONE_SLOT_MODE set, we fold in ThumbyOne's shared handoff
-# source (for QMI/ATRANS fast-XIP restore + cross-slot handoff
-# API) and mark the UF2 family as "absolute" so ThumbyOne's
-# combiner routes the blocks into the MPY partition.
+# THUMBYONE_SLOT_MODE set and THUMBYONE_ROOT pointing at the
+# ThumbyOne repository root, we fold in:
+#
+#   - common handoff (QMI/ATRANS fast-XIP restore + cross-slot
+#     handoff API)
+#   - common FS layer (thumbyone_disk / thumbyone_diskio /
+#     thumbyone_fs) so the C picker can mount the shared FAT
+#     without going through MicroPython's extmod VFS
+#   - picker UI (lcd_gc9107, font, picker.c) — runs before
+#     mp_init() in main.c and writes the chosen game path to
+#     /.active_game for the frozen thumbyone_launcher.py to exec
+#
+# UF2 family tag switches to "absolute" so ThumbyOne's combiner
+# routes the blocks into the MPY partition.
 #
 # Must run BEFORE pico_add_extra_outputs so the family property
 # is set when the UF2 is generated. Standalone path untouched.
 if (THUMBYONE_SLOT_MODE)
+    if (NOT DEFINED THUMBYONE_ROOT)
+        message(FATAL_ERROR "THUMBYONE_SLOT_MODE set but THUMBYONE_ROOT missing — "
+                            "the parent ThumbyOne build must pass -DTHUMBYONE_ROOT=/path/to/ThumbyOne")
+    endif()
     target_compile_definitions(${MICROPY_TARGET} PRIVATE THUMBYONE_SLOT_MODE=1)
-    target_sources(${MICROPY_TARGET} PRIVATE ${THUMBYONE_COMMON_SRC})
-    target_include_directories(${MICROPY_TARGET} PRIVATE ${THUMBYONE_COMMON_INCLUDE})
+
+    # Override the Tiny Game Engine's flash resource scratch region
+    # so it stays inside the MPY partition instead of clobbering the
+    # sibling slots (NES at 0x20000 + P8 + DOOM live below the MPY
+    # image). MPY partition: 0x420000..0x620000 (2 MiB). Reserve the
+    # upper 768 KiB for scratch (base 0x560000), leaving 1.25 MiB
+    # for firmware growth. PICO_FLASH_SIZE_BYTES is the whole chip,
+    # so we don't use the engine's default formula here.
+    target_compile_definitions(${MICROPY_TARGET} PRIVATE
+        FLASH_RESOURCE_SPACE_BASE=0x560000u
+        FLASH_RESOURCE_SPACE_SIZE=0xC0000u
+    )
+
+    # /system/ ROM VFS — pack the engine's filesystem/system/ tree
+    # into a C blob + entry table at build time, then compile it
+    # alongside the VFS shim. MicroPython mounts the resulting
+    # `thumbyone_rom.ThumbyOneRomVFS()` at /system in _boot_fat.py
+    # so that open("/system/...") reads straight out of flash ROM
+    # instead of the shared FAT (saves ~376 KB and avoids the
+    # first-boot copy dance).
+    set(THUMBYONE_SYSTEM_SRC_DIR  ${MICROPY_DIR}/TinyCircuits-Tiny-Game-Engine/filesystem/system)
+    set(THUMBYONE_SYSTEM_GEN_DIR  ${CMAKE_BINARY_DIR}/thumbyone_system)
+    set(THUMBYONE_SYSTEM_GEN_C    ${THUMBYONE_SYSTEM_GEN_DIR}/tbyone_system_data.c)
+    set(THUMBYONE_PACK_SCRIPT     ${THUMBYONE_ROOT}/tools/pack_system_rom.py)
+
+    file(MAKE_DIRECTORY ${THUMBYONE_SYSTEM_GEN_DIR})
+
+    # Re-run the packer whenever the script changes or any file under
+    # filesystem/system/ is touched. CMake's DEPENDS can't do a recursive
+    # glob at configure time and re-evaluate it, so we fall back to a
+    # manual glob here — rare enough that a stale DEPENDS list is easy
+    # to invalidate by rerunning cmake if assets were added.
+    file(GLOB_RECURSE THUMBYONE_SYSTEM_ASSETS
+         CONFIGURE_DEPENDS
+         ${THUMBYONE_SYSTEM_SRC_DIR}/*)
+
+    add_custom_command(
+        OUTPUT  ${THUMBYONE_SYSTEM_GEN_C}
+        COMMAND ${Python3_EXECUTABLE} ${THUMBYONE_PACK_SCRIPT}
+                ${THUMBYONE_SYSTEM_SRC_DIR}
+                ${THUMBYONE_SYSTEM_GEN_C}
+        DEPENDS ${THUMBYONE_PACK_SCRIPT}
+                ${THUMBYONE_SYSTEM_ASSETS}
+        COMMENT "Packing /system/ ROM blob from ${THUMBYONE_SYSTEM_SRC_DIR}"
+        VERBATIM
+    )
+
+    target_sources(${MICROPY_TARGET} PRIVATE
+        # handoff
+        ${THUMBYONE_ROOT}/common/thumbyone_handoff.c
+        # FS layer — picker needs thumbyone_fs_mount + FatFs for /games
+        # scan. thumbyone_diskio.c is NOT included: extmod's own
+        # vfs_fat_diskio.c owns the disk_read/write/ioctl symbols in
+        # this build and has a fallback to thumbyone_disk when MP's
+        # bdev isn't mounted yet (the pre-Python picker window).
+        ${THUMBYONE_ROOT}/common/fs/thumbyone_disk.c
+        ${THUMBYONE_ROOT}/common/fs/thumbyone_fs.c
+        # picker UI (LCD/font/picker + BMP loader for game icons)
+        ${THUMBYONE_ROOT}/common/picker/lcd_gc9107.c
+        ${THUMBYONE_ROOT}/common/picker/font.c
+        ${THUMBYONE_ROOT}/common/picker/picker_bmp.c
+        ${THUMBYONE_ROOT}/common/picker/picker.c
+        # /system/ ROM VFS
+        ${MICROPY_PORT_DIR}/thumbyone_rom_vfs.c
+        ${THUMBYONE_SYSTEM_GEN_C}
+    )
+    target_include_directories(${MICROPY_TARGET} PRIVATE
+        ${THUMBYONE_ROOT}/common
+        ${THUMBYONE_ROOT}/common/fs
+        ${THUMBYONE_ROOT}/common/picker
+        # common/fs/thumbyone_diskio.c + thumbyone_fs.c include
+        # "ff.h" bare, so FatFs headers need to be on the include
+        # path directly (not just at "lib/fatfs/ff.h" like vfs_fat
+        # uses). MICROPY_FATFS_DIR is set in extmod.cmake.
+        ${MICROPY_FATFS_DIR}
+    )
+    # thumbyone_rom_vfs.c registers its module via MP_REGISTER_MODULE
+    # and defines new qstrs (ThumbyOneRomVFS, thumbyone_rom, RomFile);
+    # it needs to be in the qstr scan too so those symbols resolve.
+    list(APPEND MICROPY_SOURCE_QSTR ${MICROPY_PORT_DIR}/thumbyone_rom_vfs.c)
     pico_set_uf2_family(${MICROPY_TARGET} "absolute")
 endif()
 

@@ -58,6 +58,16 @@
 #include "lib/fatfs/diskio.h"
 #include "extmod/vfs_fat.h"
 
+#ifdef THUMBYONE_SLOT_MODE
+/* ThumbyOne MPY slot fallback. Before MicroPython is initialised,
+ * the C picker mounts the shared FAT to scan /games/ and write
+ * /.active_game. At that point g_mounted is NULL (no VfsFat yet),
+ * so disk_read/write/ioctl divert to thumbyone_disk directly. Once
+ * MPY's VfsFat(bdev) make_new runs and sets g_mounted, everything
+ * routes through the bdev blockdev as normal. */
+#include "thumbyone_disk.h"
+#endif
+
 /*
  * Currently-mounted VfsFat. vfs_fat.c sets this via
  * mp_vfs_fat_set_mounted() immediately before the corresponding
@@ -83,7 +93,12 @@ DSTATUS disk_initialize(BYTE pdrv) {
     (void)pdrv;
     fs_user_mount_t *vfs = g_mounted;
     if (vfs == NULL) {
+#ifdef THUMBYONE_SLOT_MODE
+        /* Picker-window fallback: thumbyone_disk needs no init. */
+        return 0;
+#else
         return STA_NOINIT;
+#endif
     }
     /* The bdev's init IOCTL gets driven in disk_ioctl(IOCTL_INIT);
      * here we just report readiness based on whether a bdev is
@@ -98,7 +113,11 @@ DSTATUS disk_status(BYTE pdrv) {
     (void)pdrv;
     fs_user_mount_t *vfs = g_mounted;
     if (vfs == NULL) {
+#ifdef THUMBYONE_SLOT_MODE
+        return 0;   /* picker-window fallback */
+#else
         return STA_NOINIT;
+#endif
     }
     if (vfs->blockdev.writeblocks[0] == MP_OBJ_NULL) {
         return STA_PROTECT;
@@ -113,7 +132,12 @@ DRESULT disk_read(BYTE pdrv, BYTE *buff, LBA_t sector, UINT count) {
     (void)pdrv;
     fs_user_mount_t *vfs = g_mounted;
     if (vfs == NULL) {
+#ifdef THUMBYONE_SLOT_MODE
+        return (thumbyone_disk_read(buff, (uint32_t)sector, count) == 0)
+               ? RES_OK : RES_ERROR;
+#else
         return RES_PARERR;
+#endif
     }
     int ret = mp_vfs_blockdev_read(&vfs->blockdev, (uint32_t)sector, count, buff);
     return ret == 0 ? RES_OK : RES_ERROR;
@@ -127,7 +151,12 @@ DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count) {
     (void)pdrv;
     fs_user_mount_t *vfs = g_mounted;
     if (vfs == NULL) {
+#ifdef THUMBYONE_SLOT_MODE
+        return (thumbyone_disk_write(buff, (uint32_t)sector, count) == 0)
+               ? RES_OK : RES_ERROR;
+#else
         return RES_PARERR;
+#endif
     }
     int ret = mp_vfs_blockdev_write(&vfs->blockdev, (uint32_t)sector, count, buff);
     if (ret == -MP_EROFS) {
@@ -144,7 +173,27 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff) {
     (void)pdrv;
     fs_user_mount_t *vfs = g_mounted;
     if (vfs == NULL) {
+#ifdef THUMBYONE_SLOT_MODE
+        /* Picker-window fallback: answer via thumbyone_disk. */
+        switch (cmd) {
+        case CTRL_SYNC:
+            return (thumbyone_disk_sync() == 0) ? RES_OK : RES_ERROR;
+        case GET_SECTOR_COUNT:
+            *((LBA_t *)buff) = (LBA_t)thumbyone_disk_sector_count();
+            return RES_OK;
+        case GET_SECTOR_SIZE:
+            *((WORD *)buff) = (WORD)thumbyone_disk_sector_size();
+            return RES_OK;
+        case GET_BLOCK_SIZE:
+            *((DWORD *)buff) = (DWORD)(THUMBYONE_DISK_ERASE_SIZE /
+                                       THUMBYONE_DISK_SECTOR_SIZE);
+            return RES_OK;
+        default:
+            return RES_PARERR;
+        }
+#else
         return RES_PARERR;
+#endif
     }
 
     /* Route through the MicroPython block-device ioctl for the

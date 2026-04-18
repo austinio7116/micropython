@@ -51,6 +51,14 @@
 #include "pico/binary_info.h"
 #include "pico/unique_id.h"
 #include "hardware/structs/rosc.h"
+
+#ifdef THUMBYONE_SLOT_MODE
+/* ThumbyOne MPY slot: show a C-level game picker before any Python
+ * runtime exists. The picker writes the chosen game directory's
+ * path to /.active_game; the frozen thumbyone_launcher.py then
+ * reads it after _boot_fat.py has mounted the shared FAT. */
+#include "picker.h"
+#endif
 #if MICROPY_PY_LWIP
 #include "lwip/init.h"
 #include "lwip/apps/mdns.h"
@@ -86,6 +94,16 @@ int main(int argc, char **argv) {
 
     pendsv_init();
     soft_timer_init();
+
+    #ifdef THUMBYONE_SLOT_MODE
+    /* ThumbyOne MPY slot: run the game picker before anything else
+     * MicroPython-related. Picker sets sys clock to 250 MHz, inits
+     * LCD+buttons, mounts the shared FAT, writes /.active_game on
+     * selection, then unmounts and returns. If the user long-holds
+     * MENU, the picker calls thumbyone_handoff_request_lobby() and
+     * does NOT return (the slot reboots back to the lobby). */
+    thumbyone_picker_run();
+    #endif
 
     #if MICROPY_HW_ENABLE_UART_REPL
     bi_decl(bi_program_feature("UART REPL"))
@@ -176,6 +194,16 @@ int main(int argc, char **argv) {
         pyexec_frozen_module("_boot_fat.py", false);
         #else
         pyexec_frozen_module("_boot.py", false);
+        #endif
+
+        #ifdef THUMBYONE_SLOT_MODE
+        /* ThumbyOne MPY slot: after _boot_fat.py has mounted the
+         * shared FAT, run the launcher which reads /.active_game
+         * and execs /games/<name>/main.py. If the active-game file
+         * is missing (picker didn't write one, or the game deleted
+         * it to return to picker-on-next-boot), the launcher falls
+         * through to the normal REPL path. */
+        pyexec_frozen_module("thumbyone_launcher.py", false);
         #endif
 
         // Execute user scripts.
