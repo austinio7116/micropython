@@ -2,23 +2,16 @@ import vfs
 import machine, rp2
 
 
-# ThumbyOne: the lobby is the ONLY thing that's allowed to mkfs the
-# shared FAT. If VfsFat can't mount, DO NOT auto-format — that path
-# was silently wiping the user's entire drive when something went
-# wrong after a picker → MicroPython handoff (e.g. VfsFat's internal
-# f_mount returned a transient error for any reason). Fail loudly
-# instead: catch the exception, log a marker for the launcher trace
-# to pick up, and let the launcher continue. Without a mounted root
-# the launcher will fail to open /.active_game — which is a
-# recoverable state (reboot to lobby, all files intact).
+# ThumbyOne: the lobby is the ONLY thing allowed to format the
+# shared FAT. Do NOT pass mkfs=True on mount — a transient mount
+# failure from a slot would otherwise silently wipe the user's
+# entire drive. If mount fails here, fail loudly (raise) and let
+# main.c fall through to the REPL with the picker's last frame on
+# screen; the user reboots to the lobby (LB+RB is the documented
+# wipe path) and their files are intact.
 bdev = rp2.Flash()
-_mount_err = None
-try:
-    fs = vfs.VfsFat(bdev)
-    vfs.mount(fs, "/")
-except Exception as e:
-    _mount_err = e
-    fs = None
+fs = vfs.VfsFat(bdev)
+vfs.mount(fs, "/")
 
 # ThumbyOne: mount the ROM-backed /system/ VFS on top of the shared
 # FAT. The engine's filesystem/system/ tree (fonts, launcher assets,
@@ -32,14 +25,5 @@ try:
     del thumbyone_rom
 except ImportError:
     pass
-except Exception:
-    pass
 
-# Stash the mount error on the vfs module so the launcher can pick
-# it up and include it in /.launch_trace.txt. Using vfs.* as a
-# scratch namespace — it's guaranteed to be importable by the
-# launcher. On success this stays None.
-vfs._thumbyone_boot_fat_mount_err = _mount_err
-
-del _mount_err
-del bdev, fs
+del vfs, bdev, fs
