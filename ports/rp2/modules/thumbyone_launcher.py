@@ -40,12 +40,33 @@ def _trace(msg):
 
 def _run_active_game():
     # First stage — wipe any previous trace so the file only contains
-    # the current launch attempt.
+    # the current launch attempt. This write itself goes through the
+    # root mount; if _boot_fat.py failed to mount the FAT this will
+    # raise, so we report that separately below.
+    mount_err = None
+    try:
+        import vfs as _vfs_mod
+        mount_err = getattr(_vfs_mod, "_thumbyone_boot_fat_mount_err", None)
+    except Exception:
+        pass
+
     try:
         with open(_TRACE_PATH, "w") as f:
             f.write("launcher start\n")
+            if mount_err is not None:
+                f.write("FAT MOUNT FAILED: " + repr(mount_err) + "\n")
     except Exception:
-        pass
+        # Trace write failed — no point continuing; user won't see
+        # anything but we can't write an error either. Return so
+        # main.c drops to the (invisible) REPL.
+        return
+
+    if mount_err is not None:
+        # No mounted FAT = nothing to launch. The picker wrote
+        # /.active_game before the handoff, but we can't read it now.
+        # Let the user return to the lobby; their files are intact
+        # because we no longer auto-format.
+        return
 
     try:
         with open("/.active_game") as f:
