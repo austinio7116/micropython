@@ -234,6 +234,33 @@ SECTIONS
         __HeapLimit = .;
     } > RAM
 
+    /* ThumbyOne slot-mode picker scratch.
+     *
+     * The pre-MicroPython C picker (ThumbyOne/common/picker/picker.c)
+     * owns several large static buffers (framebuffer, icon cache,
+     * game-metadata table) that are ONLY used before mp_init(). If
+     * we placed them in regular .bss they'd push __bss_end__ up and
+     * permanently steal that RAM from the MicroPython GC heap.
+     *
+     * Instead we put them in this NOLOAD section pinned to the
+     * start of the GC heap range (= __bss_end__ + c_heap_size).
+     * Because the section is WITHIN [__GcHeapStart, __GcHeapEnd),
+     * gc_init() claims the same bytes as heap — during picker the
+     * buffers hold their data as normal; once MicroPython's GC is
+     * up those bytes are just "free memory" from the GC's point of
+     * view and get reused for allocations. The libc sbrk region
+     * [__end__, __StackLimit) sits BELOW this and doesn't overlap.
+     *
+     * Empty for non-slot builds (no objects go into .picker_scratch),
+     * so this costs nothing when MicroPython is built standalone. */
+    __picker_scratch_base__ = __bss_end__ + __micropy_c_heap_size__;
+    .picker_scratch __picker_scratch_base__ (NOLOAD) : ALIGN(4) {
+        __picker_scratch_start__ = .;
+        KEEP(*(.picker_scratch))
+        . = ALIGN(4);
+        __picker_scratch_end__ = .;
+    } > RAM
+
     /* Start and end symbols must be word-aligned */
     .scratch_x : {
         __scratch_x_start__ = .;
