@@ -25,6 +25,20 @@
  * THE SOFTWARE.
  */
 
+/*
+ * ThumbyOne fork: ported from ooFatFs (R0.13c, MicroPython fork
+ * with opaque bdev pointers in the fs-operations API) to plain
+ * FatFs R0.15 (numeric drive number in diskio, volume-qualified
+ * paths everywhere else). See common/lib/fatfs/ for the shared
+ * FS library used by the lobby and all slots.
+ *
+ * Single-volume invariant: FF_VOLUMES == 1. A second VfsFat
+ * construction (e.g. mounting an SD card alongside flash) is
+ * rejected with OSError at make_new time — there is no second
+ * drive on the Thumby Color, and the R0.15 API would otherwise
+ * silently clash over FatFs[0].
+ */
+
 #include "py/mpconfig.h"
 #if MICROPY_VFS_FAT
 
@@ -39,7 +53,7 @@
 #include <string.h>
 #include "py/runtime.h"
 #include "py/mperrno.h"
-#include "lib/oofatfs/ff.h"
+#include "lib/fatfs/ff.h"
 #include "extmod/vfs_fat.h"
 #include "shared/timeutils/timeutils.h"
 
@@ -51,11 +65,52 @@
 
 #define mp_obj_fat_vfs_t fs_user_mount_t
 
+/* Canonical MKFS_PARM — MUST match ThumbyNES and ThumbyP8's
+ * boot_filesystem() so the shared FAT at physical 0x660000
+ * interops byte-identically across all four slots.
+ *
+ * Shape: FAT16, 1 KB clusters, single-FAT, MBR-partitioned.
+ *
+ *   fmt = FM_FAT      — FAT16 (no FAT32, no exFAT, no FM_SFD).
+ *                       WITHOUT FM_SFD an MBR partition table
+ *                       lives at sector 0 and the FAT volume at
+ *                       the partition start. Windows treats the
+ *                       9.6 MB volume as a standard removable
+ *                       drive when it sees the MBR; SFD (no MBR)
+ *                       can trigger "the drive is not formatted"
+ *                       prompts on some Windows versions.
+ *   n_fat = 1         — one FAT copy; saves 18 KB on a 9.6 MB
+ *                       volume. Redundancy isn't worth much on
+ *                       flash that's backed by FatFs's own cache.
+ *   au_size = 1024    — 1 KB clusters → 9600 clusters, above the
+ *                       FAT12 4084 cap, well below FAT16's 65524.
+ *
+ * The lobby's own mkfs path (when we add lobby-owned formatting)
+ * will reference this same struct. */
+static const MKFS_PARM mkfs_default_opt = {
+    .fmt = FM_FAT,
+    .n_fat = 1,
+    .align = 0,
+    .n_root = 0,
+    .au_size = 1024,
+};
+
+/* ThumbyOne: reject second mount attempt. Called by make_new and
+ * mkfs. Upstream ooFatFs tolerates multiple VFSes, R0.15 does not
+ * (the globals collide), and we deliberately only support one. */
+static void check_single_volume_or_raise(void) {
+    if (mp_vfs_fat_get_mounted() != NULL) {
+        mp_raise_OSError_with_filename(MP_EBUSY,
+            "VfsFat is single-volume (FF_VOLUMES=1); unmount the existing one first");
+    }
+}
+
 static mp_import_stat_t fat_vfs_import_stat(void *vfs_in, const char *path) {
     fs_user_mount_t *vfs = vfs_in;
     FILINFO fno;
     assert(vfs != NULL);
-    FRESULT res = f_stat(&vfs->fatfs, path, &fno);
+    (void)vfs;
+    FRESULT res = f_stat(path, &fno);
     if (res == FR_OK) {
         if ((fno.fattrib & AM_DIR) != 0) {
             return MP_IMPORT_STAT_DIR;
@@ -69,54 +124,91 @@ static mp_import_stat_t fat_vfs_import_stat(void *vfs_in, const char *path) {
 static mp_obj_t fat_vfs_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args) {
     mp_arg_check_num(n_args, n_kw, 1, 1, false);
 
+    /* Single-volume invariant — see top-of-file comment. */
+    check_single_volume_or_raise();
+
     // create new object
     fs_user_mount_t *vfs = mp_obj_malloc(fs_user_mount_t, type);
-    vfs->fatfs.drv = vfs;
 
     // Initialise underlying block device
     vfs->blockdev.flags = MP_BLOCKDEV_FLAG_FREE_OBJ;
     vfs->blockdev.block_size = FF_MIN_SS; // default, will be populated by call to MP_BLOCKDEV_IOCTL_BLOCK_SIZE
     mp_vfs_blockdev_init(&vfs->blockdev, args[0]);
 
-    // mount the block device so the VFS methods can be used
-    FRESULT res = f_mount(&vfs->fatfs);
+    /* Register as the single active mount BEFORE calling f_mount so
+     * that the diskio layer (disk_read/write/ioctl) can find our
+     * blockdev when FatFs starts probing the BPB. If f_mount fails
+     * we leave g_mounted set — the FATFS struct is still bound to
+     * drive 0 in FatFs[] and later .mount(mkfs=True) will want to
+     * drive disk_write through it. */
+    mp_vfs_fat_set_mounted(vfs);
+
+    FRESULT res = f_mount(&vfs->fatfs, "", 1);
     if (res == FR_NO_FILESYSTEM) {
-        // don't error out if no filesystem, to let mkfs()/mount() create one if wanted
+        /* Leave the vfs object alive — mount(mkfs=True) will build
+         * a FS on it. g_mounted stays set. */
         vfs->blockdev.flags |= MP_BLOCKDEV_FLAG_NO_FILESYSTEM;
     } else if (res != FR_OK) {
+        /* Unbind before raising — otherwise a retry can't create
+         * a new VfsFat. f_mount with fs=0 clears the slot. */
+        f_mount(0, "", 0);
+        mp_vfs_fat_set_mounted(NULL);
         mp_raise_OSError(fresult_to_errno_table[res]);
     }
 
     return MP_OBJ_FROM_PTR(vfs);
 }
 
-#if _FS_REENTRANT
+#if FF_FS_REENTRANT
 static mp_obj_t fat_vfs_del(mp_obj_t self_in) {
     mp_obj_fat_vfs_t *self = MP_OBJ_TO_PTR(self_in);
-    // f_umount only needs to be called to release the sync object
-    f_umount(&self->fatfs);
+    (void)self;
+    /* R0.15's f_unmount("") expands to f_mount(0, "", 0) — releases
+     * any sync object and clears FatFs[0]. We also drop g_mounted
+     * so a fresh VfsFat can be created in the next GC cycle. */
+    f_unmount("");
+    if (mp_vfs_fat_get_mounted() == self) {
+        mp_vfs_fat_set_mounted(NULL);
+    }
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(fat_vfs_del_obj, fat_vfs_del);
 #endif
 
 static mp_obj_t fat_vfs_mkfs(mp_obj_t bdev_in) {
-    // create new object
+    // create new object (also binds g_mounted, opens drive 0)
     fs_user_mount_t *vfs = MP_OBJ_TO_PTR(fat_vfs_make_new(&mp_fat_vfs_type, 1, 0, &bdev_in));
 
-    // make the filesystem
+    /* R0.15 f_mkfs: path-addressed, MKFS_PARM-configured. Use our
+     * canonical parameters so the on-disk shape matches the lobby. */
     uint8_t working_buf[FF_MAX_SS];
-    FRESULT res = f_mkfs(&vfs->fatfs, FM_FAT | FM_SFD, 0, working_buf, sizeof(working_buf));
-    if (res == FR_MKFS_ABORTED) { // Probably doesn't support FAT16
-        res = f_mkfs(&vfs->fatfs, FM_FAT32, 0, working_buf, sizeof(working_buf));
+    FRESULT res = f_mkfs("", &mkfs_default_opt, working_buf, sizeof(working_buf));
+    if (res == FR_MKFS_ABORTED) {
+        /* Falling back to FAT32 — happens if the volume is too
+         * small for the requested FAT16 geometry or too large for
+         * the au_size. For Thumby Color's 9.6 MB this shouldn't
+         * happen; keep the fallback for safety on smaller test
+         * volumes. */
+        MKFS_PARM fallback = mkfs_default_opt;
+        fallback.fmt = FM_FAT32;
+        fallback.au_size = 0;   /* let FatFs pick */
+        res = f_mkfs("", &fallback, working_buf, sizeof(working_buf));
     }
     if (res != FR_OK) {
         mp_raise_OSError(fresult_to_errno_table[res]);
     }
 
+    /* f_mkfs wrote a new BPB to disk but doesn't populate the
+     * FATFS struct. Re-mount to refresh in-memory state. */
+    res = f_mount(&vfs->fatfs, "", 1);
+    if (res != FR_OK) {
+        mp_raise_OSError(fresult_to_errno_table[res]);
+    }
+    vfs->blockdev.flags &= ~MP_BLOCKDEV_FLAG_NO_FILESYSTEM;
+
     // set the filesystem label if it's configured
     #ifdef MICROPY_HW_FLASH_FS_LABEL
-    f_setlabel(&vfs->fatfs, MICROPY_HW_FLASH_FS_LABEL);
+    f_setlabel(MICROPY_HW_FLASH_FS_LABEL);
     #endif
 
     return mp_const_none;
@@ -129,7 +221,7 @@ typedef struct _mp_vfs_fat_ilistdir_it_t {
     mp_fun_1_t iternext;
     mp_fun_1_t finaliser;
     bool is_str;
-    FF_DIR dir;
+    DIR dir;
 } mp_vfs_fat_ilistdir_it_t;
 
 static mp_obj_t mp_vfs_fat_ilistdir_it_iternext(mp_obj_t self_in) {
@@ -181,6 +273,7 @@ static mp_obj_t mp_vfs_fat_ilistdir_it_del(mp_obj_t self_in) {
 
 static mp_obj_t fat_vfs_ilistdir_func(size_t n_args, const mp_obj_t *args) {
     mp_obj_fat_vfs_t *self = MP_OBJ_TO_PTR(args[0]);
+    (void)self;
     bool is_str_type = true;
     const char *path;
     if (n_args == 2) {
@@ -197,7 +290,7 @@ static mp_obj_t fat_vfs_ilistdir_func(size_t n_args, const mp_obj_t *args) {
     iter->iternext = mp_vfs_fat_ilistdir_it_iternext;
     iter->finaliser = mp_vfs_fat_ilistdir_it_del;
     iter->is_str = is_str_type;
-    FRESULT res = f_opendir(&self->fatfs, &iter->dir, path);
+    FRESULT res = f_opendir(&iter->dir, path);
     if (res != FR_OK) {
         mp_raise_OSError(fresult_to_errno_table[res]);
     }
@@ -208,10 +301,11 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(fat_vfs_ilistdir_obj, 1, 2, fat_vfs_i
 
 static mp_obj_t fat_vfs_remove_internal(mp_obj_t vfs_in, mp_obj_t path_in, mp_int_t attr) {
     mp_obj_fat_vfs_t *self = MP_OBJ_TO_PTR(vfs_in);
+    (void)self;
     const char *path = mp_obj_str_get_str(path_in);
 
     FILINFO fno;
-    FRESULT res = f_stat(&self->fatfs, path, &fno);
+    FRESULT res = f_stat(path, &fno);
 
     if (res != FR_OK) {
         mp_raise_OSError(fresult_to_errno_table[res]);
@@ -219,7 +313,7 @@ static mp_obj_t fat_vfs_remove_internal(mp_obj_t vfs_in, mp_obj_t path_in, mp_in
 
     // check if path is a file or directory
     if ((fno.fattrib & AM_DIR) == attr) {
-        res = f_unlink(&self->fatfs, path);
+        res = f_unlink(path);
 
         if (res != FR_OK) {
             mp_raise_OSError(fresult_to_errno_table[res]);
@@ -242,14 +336,15 @@ static MP_DEFINE_CONST_FUN_OBJ_2(fat_vfs_rmdir_obj, fat_vfs_rmdir);
 
 static mp_obj_t fat_vfs_rename(mp_obj_t vfs_in, mp_obj_t path_in, mp_obj_t path_out) {
     mp_obj_fat_vfs_t *self = MP_OBJ_TO_PTR(vfs_in);
+    (void)self;
     const char *old_path = mp_obj_str_get_str(path_in);
     const char *new_path = mp_obj_str_get_str(path_out);
-    FRESULT res = f_rename(&self->fatfs, old_path, new_path);
+    FRESULT res = f_rename(old_path, new_path);
     if (res == FR_EXIST) {
         // if new_path exists then try removing it (but only if it's a file)
         fat_vfs_remove_internal(vfs_in, path_out, 0); // 0 == file attribute
         // try to rename again
-        res = f_rename(&self->fatfs, old_path, new_path);
+        res = f_rename(old_path, new_path);
     }
     if (res == FR_OK) {
         return mp_const_none;
@@ -262,8 +357,9 @@ static MP_DEFINE_CONST_FUN_OBJ_3(fat_vfs_rename_obj, fat_vfs_rename);
 
 static mp_obj_t fat_vfs_mkdir(mp_obj_t vfs_in, mp_obj_t path_o) {
     mp_obj_fat_vfs_t *self = MP_OBJ_TO_PTR(vfs_in);
+    (void)self;
     const char *path = mp_obj_str_get_str(path_o);
-    FRESULT res = f_mkdir(&self->fatfs, path);
+    FRESULT res = f_mkdir(path);
     if (res == FR_OK) {
         return mp_const_none;
     } else {
@@ -275,10 +371,11 @@ static MP_DEFINE_CONST_FUN_OBJ_2(fat_vfs_mkdir_obj, fat_vfs_mkdir);
 // Change current directory.
 static mp_obj_t fat_vfs_chdir(mp_obj_t vfs_in, mp_obj_t path_in) {
     mp_obj_fat_vfs_t *self = MP_OBJ_TO_PTR(vfs_in);
+    (void)self;
     const char *path;
     path = mp_obj_str_get_str(path_in);
 
-    FRESULT res = f_chdir(&self->fatfs, path);
+    FRESULT res = f_chdir(path);
 
     if (res != FR_OK) {
         mp_raise_OSError(fresult_to_errno_table[res]);
@@ -291,8 +388,9 @@ static MP_DEFINE_CONST_FUN_OBJ_2(fat_vfs_chdir_obj, fat_vfs_chdir);
 // Get the current directory.
 static mp_obj_t fat_vfs_getcwd(mp_obj_t vfs_in) {
     mp_obj_fat_vfs_t *self = MP_OBJ_TO_PTR(vfs_in);
+    (void)self;
     char buf[MICROPY_ALLOC_PATH_MAX + 1];
-    FRESULT res = f_getcwd(&self->fatfs, buf, sizeof(buf));
+    FRESULT res = f_getcwd(buf, sizeof(buf));
     if (res != FR_OK) {
         mp_raise_OSError(fresult_to_errno_table[res]);
     }
@@ -303,6 +401,7 @@ static MP_DEFINE_CONST_FUN_OBJ_1(fat_vfs_getcwd_obj, fat_vfs_getcwd);
 // Get the status of a file or directory.
 static mp_obj_t fat_vfs_stat(mp_obj_t vfs_in, mp_obj_t path_in) {
     mp_obj_fat_vfs_t *self = MP_OBJ_TO_PTR(vfs_in);
+    (void)self;
     const char *path = mp_obj_str_get_str(path_in);
 
     FILINFO fno;
@@ -313,7 +412,7 @@ static mp_obj_t fat_vfs_stat(mp_obj_t vfs_in, mp_obj_t path_in) {
         fno.ftime = 0;
         fno.fattrib = AM_DIR;
     } else {
-        FRESULT res = f_stat(&self->fatfs, path, &fno);
+        FRESULT res = f_stat(path, &fno);
         if (res != FR_OK) {
             mp_raise_OSError(fresult_to_errno_table[res]);
         }
@@ -352,11 +451,12 @@ static MP_DEFINE_CONST_FUN_OBJ_2(fat_vfs_stat_obj, fat_vfs_stat);
 // Get the status of a VFS.
 static mp_obj_t fat_vfs_statvfs(mp_obj_t vfs_in, mp_obj_t path_in) {
     mp_obj_fat_vfs_t *self = MP_OBJ_TO_PTR(vfs_in);
+    (void)self;
     (void)path_in;
 
     DWORD nclst;
-    FATFS *fatfs = &self->fatfs;
-    FRESULT res = f_getfree(fatfs, &nclst);
+    FATFS *fatfs;
+    FRESULT res = f_getfree("", &nclst, &fatfs);
     if (FR_OK != res) {
         mp_raise_OSError(fresult_to_errno_table[res]);
     }
@@ -393,7 +493,12 @@ static mp_obj_t vfs_fat_mount(mp_obj_t self_in, mp_obj_t readonly, mp_obj_t mkfs
     FRESULT res = (self->blockdev.flags & MP_BLOCKDEV_FLAG_NO_FILESYSTEM) ? FR_NO_FILESYSTEM : FR_OK;
     if (res == FR_NO_FILESYSTEM && mp_obj_is_true(mkfs)) {
         uint8_t working_buf[FF_MAX_SS];
-        res = f_mkfs(&self->fatfs, FM_FAT | FM_SFD, 0, working_buf, sizeof(working_buf));
+        res = f_mkfs("", &mkfs_default_opt, working_buf, sizeof(working_buf));
+        if (res == FR_OK) {
+            /* Refresh in-memory FATFS state after the write. See
+             * comment in fat_vfs_mkfs for why this is required. */
+            res = f_mount(&self->fatfs, "", 1);
+        }
     }
     if (res != FR_OK) {
         mp_raise_OSError(fresult_to_errno_table[res]);
@@ -405,14 +510,18 @@ static mp_obj_t vfs_fat_mount(mp_obj_t self_in, mp_obj_t readonly, mp_obj_t mkfs
 static MP_DEFINE_CONST_FUN_OBJ_3(vfs_fat_mount_obj, vfs_fat_mount);
 
 static mp_obj_t vfs_fat_umount(mp_obj_t self_in) {
-    (void)self_in;
-    // keep the FAT filesystem mounted internally so the VFS methods can still be used
+    fs_user_mount_t *self = MP_OBJ_TO_PTR(self_in);
+    (void)self;
+    /* keep the FAT filesystem mounted internally so the VFS methods
+     * can still be used — matches upstream behaviour. If the user
+     * really wants to hard-unmount (e.g. to replace with a second
+     * VfsFat), they can delete the object and force GC. */
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(fat_vfs_umount_obj, vfs_fat_umount);
 
 static const mp_rom_map_elem_t fat_vfs_locals_dict_table[] = {
-    #if _FS_REENTRANT
+    #if FF_FS_REENTRANT
     { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&fat_vfs_del_obj) },
     #endif
     { MP_ROM_QSTR(MP_QSTR_mkfs), MP_ROM_PTR(&fat_vfs_mkfs_obj) },

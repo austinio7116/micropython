@@ -110,8 +110,8 @@ set(MICROPY_SOURCE_LIB
     ${MICROPY_DIR}/lib/littlefs/lfs1_util.c
     ${MICROPY_DIR}/lib/littlefs/lfs2.c
     ${MICROPY_DIR}/lib/littlefs/lfs2_util.c
-    ${MICROPY_DIR}/lib/oofatfs/ff.c
-    ${MICROPY_DIR}/lib/oofatfs/ffunicode.c
+    ${MICROPY_FATFS_DIR}/ff.c
+    ${MICROPY_FATFS_DIR}/ffunicode.c
     ${MICROPY_DIR}/shared/netutils/dhcpserver.c
     ${MICROPY_DIR}/shared/netutils/netutils.c
     ${MICROPY_DIR}/shared/netutils/trace.c
@@ -551,9 +551,20 @@ set_source_files_properties(
     COMPILE_OPTIONS "-Wno-error=array-bounds;-Wno-error=unused-but-set-variable"
 )
 
+# FatFs R0.15 ff.c hits a stringop-overflow false-positive with the
+# GCC version pinned by the current toolchain — only surfaces
+# when MICROPY_VFS_FAT + MICROPY_HW_USB_MSC are both enabled
+# (Thumby Color's ThumbyOne slot-mode config). Vendor code; leave
+# unmodified and just suppress the warning here.
+set_source_files_properties(
+    ${MICROPY_FATFS_DIR}/ff.c
+    PROPERTIES
+    COMPILE_OPTIONS "-Wno-error=stringop-overflow"
+)
+
 target_compile_definitions(${MICROPY_TARGET} PRIVATE
     ${MICROPY_DEF_BOARD}
-    FFCONF_H=\"${MICROPY_OOFATFS_DIR}/ffconf.h\"
+    FFCONF_H=\"${MICROPY_FATFS_DIR}/ffconf.h\"
     LFS1_NO_MALLOC LFS1_NO_DEBUG LFS1_NO_WARN LFS1_NO_ERROR LFS1_NO_ASSERT
     LFS2_NO_MALLOC LFS2_NO_DEBUG LFS2_NO_WARN LFS2_NO_ERROR LFS2_NO_ASSERT
     PICO_FLOAT_PROPAGATE_NANS=1
@@ -592,6 +603,24 @@ if (PICO_ON_DEVICE AND NOT PICO_NO_FLASH AND NOT PICO_COPY_TO_RAM)
     elseif(PICO_RP2350)
         pico_set_linker_script(${MICROPY_TARGET} ${CMAKE_CURRENT_LIST_DIR}/memmap_mp_rp2350.ld)
     endif()
+endif()
+
+# ----------------------------------------------------------------------
+# ThumbyOne slot-mode integration (additive, conditional).
+#
+# When the parent ThumbyOne build invokes this CMakeLists with
+# THUMBYONE_SLOT_MODE set, we fold in ThumbyOne's shared handoff
+# source (for QMI/ATRANS fast-XIP restore + cross-slot handoff
+# API) and mark the UF2 family as "absolute" so ThumbyOne's
+# combiner routes the blocks into the MPY partition.
+#
+# Must run BEFORE pico_add_extra_outputs so the family property
+# is set when the UF2 is generated. Standalone path untouched.
+if (THUMBYONE_SLOT_MODE)
+    target_compile_definitions(${MICROPY_TARGET} PRIVATE THUMBYONE_SLOT_MODE=1)
+    target_sources(${MICROPY_TARGET} PRIVATE ${THUMBYONE_COMMON_SRC})
+    target_include_directories(${MICROPY_TARGET} PRIVATE ${THUMBYONE_COMMON_INCLUDE})
+    pico_set_uf2_family(${MICROPY_TARGET} "absolute")
 endif()
 
 pico_add_extra_outputs(${MICROPY_TARGET})

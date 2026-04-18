@@ -27,7 +27,7 @@
 #define MICROPY_INCLUDED_EXTMOD_VFS_FAT_H
 
 #include "py/obj.h"
-#include "lib/oofatfs/ff.h"
+#include "lib/fatfs/ff.h"
 #include "extmod/vfs.h"
 
 typedef struct _fs_user_mount_t {
@@ -42,5 +42,10 @@ extern const mp_obj_type_t mp_type_vfs_fat_fileio;
 extern const mp_obj_type_t mp_type_vfs_fat_textio;
 
 MP_DECLARE_CONST_FUN_OBJ_3(fat_vfs_open_obj);
+
+/* Single-VFS bookkeeping (see vfs_fat_diskio.c for the rationale).
+ * FF_VOLUMES is 1, so disk_read/write/ioctl route through this. */
+void mp_vfs_fat_set_mounted(fs_user_mount_t *vfs);
+fs_user_mount_t *mp_vfs_fat_get_mounted(void);
 
 #endif // MICROPY_INCLUDED_EXTMOD_VFS_FAT_H

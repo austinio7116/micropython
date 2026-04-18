@@ -1,0 +1,25 @@
+ThumbyOne common FatFs
+======================
+
+This directory is the single source-of-truth for FatFs code across
+ALL four ThumbyOne slots (NES, P8, DOOM, MPY) AND the lobby.
+
+Contents are upstream FatFs R0.15 (see 00readme.txt for canonical
+file list) plus a ThumbyOne-specific ffconf.h. The MicroPython
+fork used to ship a customised "ooFatFs R0.13c" derivative at
+mp-thumby/lib/oofatfs/ — that directory has been deleted; the
+extmod/vfs_fat*.c glue has been ported to talk to plain R0.15
+globals.
+
+Rules:
+  * Do not modify ff.c, ff.h, ffunicode.c, or ffsystem.c without
+    a very good reason — those files are stock upstream. Keep
+    the door open to picking up upstream fixes cheaply.
+  * ffconf.h IS ours to tune. If you change it, every slot's
+    on-disk interpretation changes — think through the impact.
+  * Do not add diskio.c here. Each consumer (lobby, NES, P8,
+    MPY) provides its own disk_read/write/ioctl backed by
+    whichever flash region it sees.
+  * FF_VOLUMES is hardcoded at 1. The Thumby Color has one
+    flash, one shared FAT — if a future revision adds SD, that
+    will be a separate architectural change, not a config flip.

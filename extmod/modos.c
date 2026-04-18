@@ -36,8 +36,8 @@
 #if MICROPY_VFS_FAT
 #include "extmod/vfs_fat.h"
 #if MICROPY_PY_OS_SYNC
-#include "lib/oofatfs/ff.h"
-#include "lib/oofatfs/diskio.h"
+#include "lib/fatfs/ff.h"
+#include "lib/fatfs/diskio.h"
 #endif
 #endif
 
@@ -75,9 +75,15 @@
 // Sync all filesystems.
 static mp_obj_t mp_os_sync(void) {
     #if MICROPY_VFS_FAT
+    /* ThumbyOne: plain FatFs R0.15's disk_ioctl takes a numeric
+     * BYTE pdrv, not a bdev pointer. FF_VOLUMES = 1, so every
+     * mounted VfsFat is drive 0. Walking the vfs_mount_table just
+     * to find a VfsFat still gives us early-out on unmounted
+     * systems — but we only need to sync if ANY VfsFat exists. */
     for (mp_vfs_mount_t *vfs = MP_STATE_VM(vfs_mount_table); vfs != NULL; vfs = vfs->next) {
         if (mp_obj_is_type(vfs->obj, &mp_fat_vfs_type)) {
-            disk_ioctl(MP_OBJ_TO_PTR(vfs->obj), CTRL_SYNC, NULL);
+            disk_ioctl(0, CTRL_SYNC, NULL);
+            break;
         }
     }
     #endif

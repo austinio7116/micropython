@@ -70,16 +70,43 @@ bi_decl(bi_block_device(
     BINARY_INFO_BLOCK_DEV_FLAG_WRITE |
     BINARY_INFO_BLOCK_DEV_FLAG_PT_UNKNOWN));
 
+#ifdef THUMBYONE_SLOT_MODE
+#include "hardware/structs/qmi.h"
+#include "thumbyone_handoff.h"
+/* Single-slot scratch: the critical flash section locks out core 1,
+ * so core 0 has exclusive access while this is live. */
+static uint32_t s_saved_atrans[4];
+#endif
+
 // Flash erase and write must run with interrupts disabled and the other core suspended,
 // because the XIP bit gets disabled.
 static uint32_t begin_critical_flash_section(void) {
     if (multicore_lockout_victim_is_initialized(1 - get_core_num())) {
         multicore_lockout_start_blocking();
     }
-    return save_and_disable_interrupts();
+    uint32_t ints = save_and_disable_interrupts();
+#ifdef THUMBYONE_SLOT_MODE
+    /* SDK flash_range_erase / flash_range_program reset QMI ATRANS
+     * and the fast-XIP config on return. Save now; restore on
+     * end_critical_flash_section. Without this, the next instruction
+     * fetch reads from the wrong physical address (no ATRANS) and
+     * crashes the chained MPY image. */
+    s_saved_atrans[0] = qmi_hw->atrans[0];
+    s_saved_atrans[1] = qmi_hw->atrans[1];
+    s_saved_atrans[2] = qmi_hw->atrans[2];
+    s_saved_atrans[3] = qmi_hw->atrans[3];
+#endif
+    return ints;
 }
 
 static void end_critical_flash_section(uint32_t state) {
+#ifdef THUMBYONE_SLOT_MODE
+    qmi_hw->atrans[0] = s_saved_atrans[0];
+    qmi_hw->atrans[1] = s_saved_atrans[1];
+    qmi_hw->atrans[2] = s_saved_atrans[2];
+    qmi_hw->atrans[3] = s_saved_atrans[3];
+    thumbyone_xip_fast_setup();
+#endif
     restore_interrupts(state);
     if (multicore_lockout_victim_is_initialized(1 - get_core_num())) {
         multicore_lockout_end_blocking();

@@ -24,7 +24,12 @@
  * THE SOFTWARE.
  */
 
-#include "lib/oofatfs/ff.h"
+/* Plain FatFs R0.15's ff.h, unlike the old ooFatFs fork, does not
+ * transitively include any MicroPython headers — so pull in the
+ * MP runtime types and MP_WEAK macro explicitly before the
+ * timeutils header that relies on them. */
+#include "py/runtime.h"
+#include "lib/fatfs/ff.h"
 #include "pico/aon_timer.h"
 #include "shared/timeutils/timeutils.h"
 

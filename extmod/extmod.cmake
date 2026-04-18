@@ -1,7 +1,13 @@
 # CMake fragment for MicroPython extmod component
 
 set(MICROPY_EXTMOD_DIR "${MICROPY_DIR}/extmod")
-set(MICROPY_OOFATFS_DIR "${MICROPY_DIR}/lib/oofatfs")
+
+# ThumbyOne fork: ported off MicroPython's "ooFatFs R0.13c" (lib/oofatfs)
+# to upstream FatFs R0.15 (lib/fatfs). MICROPY_OOFATFS_DIR is kept as a
+# compatibility alias so third-party user C modules that reference it
+# still resolve — but the canonical variable is MICROPY_FATFS_DIR.
+set(MICROPY_FATFS_DIR "${MICROPY_DIR}/lib/fatfs")
+set(MICROPY_OOFATFS_DIR "${MICROPY_FATFS_DIR}")
 
 set(MICROPY_SOURCE_EXTMOD
     ${MICROPY_DIR}/shared/libc/abort_.c

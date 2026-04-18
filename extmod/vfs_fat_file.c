@@ -32,7 +32,7 @@
 #include "py/runtime.h"
 #include "py/stream.h"
 #include "py/mperrno.h"
-#include "lib/oofatfs/ff.h"
+#include "lib/fatfs/ff.h"
 #include "extmod/vfs_fat.h"
 
 // this table converts from FRESULT to POSIX errno
@@ -231,7 +231,8 @@ static mp_obj_t fat_vfs_open(mp_obj_t self_in, mp_obj_t path_in, mp_obj_t mode_i
     pyb_file_obj_t *o = mp_obj_malloc_with_finaliser(pyb_file_obj_t, type);
 
     const char *fname = mp_obj_str_get_str(path_in);
-    FRESULT res = f_open(&self->fatfs, &o->fp, fname, mode);
+    (void)self;   /* R0.15 f_open is path-addressed, not fs-addressed */
+    FRESULT res = f_open(&o->fp, fname, mode);
     if (res != FR_OK) {
         m_del_obj(pyb_file_obj_t, o);
         mp_raise_OSError(fresult_to_errno_table[res]);
