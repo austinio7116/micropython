@@ -190,7 +190,21 @@ int main(int argc, char **argv) {
         #endif
 
         // Execute _boot.py to set up the filesystem.
-        #if MICROPY_VFS_FAT && MICROPY_HW_USB_MSC
+        //
+        // Stock mp-thumby: _boot_fat.py is selected when MSC is
+        // compiled in (the "Thumby Color" MicroPython UX wants FAT
+        // because that's what the host sees over USB).
+        //
+        // Under THUMBYONE_SLOT_MODE the MPY slot doesn't enumerate
+        // USB at all (the lobby owns that), so MICROPY_HW_USB_MSC
+        // is 0 — but we STILL want _boot_fat.py because the shared
+        // FAT is the filesystem every slot agrees on. Without this
+        // branch the slot would run _boot.py, which tries to mount
+        // LittleFS on the same flash region and either hangs during
+        // the failed mount or overwrites the FAT with an empty
+        // LittleFS. Took a day to track down — see ThumbyOne commit
+        // audit for the gory details.
+        #if MICROPY_VFS_FAT && (MICROPY_HW_USB_MSC || defined(THUMBYONE_SLOT_MODE))
         pyexec_frozen_module("_boot_fat.py", false);
         #else
         pyexec_frozen_module("_boot.py", false);
