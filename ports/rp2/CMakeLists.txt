@@ -717,6 +717,14 @@ if (THUMBYONE_SLOT_MODE)
         # /system/ ROM VFS
         ${MICROPY_PORT_DIR}/thumbyone_rom_vfs.c
         ${THUMBYONE_SYSTEM_GEN_C}
+        # engine.reset() → MPY slot re-chain (via watchdog_reboot wrap)
+        ${MICROPY_PORT_DIR}/thumbyone_reset_hook.c
+    )
+    # Wrap watchdog_reboot so engine.reset() / machine.reset() bounce
+    # back into the MPY slot (and thus the C picker) rather than
+    # dropping the user at the top-level lobby.
+    target_link_options(${MICROPY_TARGET} PRIVATE
+        -Wl,--wrap=watchdog_reboot
     )
     target_include_directories(${MICROPY_TARGET} PRIVATE
         ${THUMBYONE_ROOT}/common
