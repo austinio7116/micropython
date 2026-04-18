@@ -9,7 +9,11 @@
 // this layout — deliberate, because a single Thumby Color may be
 // reflashed between standalone and ThumbyOne firmwares without
 // reformatting, and FAT on-disk layout matches across both.
+/* Guarded so the ThumbyOne slot build can disable MSC via
+ * -DMICROPY_HW_USB_MSC=0 (lobby owns USB in that mode). */
+#ifndef MICROPY_HW_USB_MSC
 #define MICROPY_HW_USB_MSC                      (1)
+#endif
 #define MICROPY_HW_FLASH_STORAGE_BYTES          (0x9A0000u)  // 9.6 MB
 #define MICROPY_HW_FLASH_STORAGE_BASE           (0x660000u)
 

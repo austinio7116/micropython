@@ -50,16 +50,18 @@
 static uint64_t time_us_64_offset_from_epoch;
 #endif
 
-#if MICROPY_HW_ENABLE_UART_REPL || MICROPY_HW_USB_CDC
-
+/* stdin_ringbuf is referenced unconditionally in mp_hal_stdin_rx_chr
+ * below, so always provide the symbol. Consumers gated on
+ * MICROPY_HW_USB_CDC / MICROPY_HW_ENABLE_UART_REPL simply never
+ * push into it. The ThumbyOne MPY slot builds with both disabled
+ * (lobby owns USB, no UART pin); the buffer sits unused but the
+ * symbol must still link. */
 #ifndef MICROPY_HW_STDIN_BUFFER_LEN
 #define MICROPY_HW_STDIN_BUFFER_LEN 512
 #endif
 
 static uint8_t stdin_ringbuf_array[MICROPY_HW_STDIN_BUFFER_LEN];
 ringbuf_t stdin_ringbuf = { stdin_ringbuf_array, sizeof(stdin_ringbuf_array) };
-
-#endif
 
 uintptr_t mp_hal_stdio_poll(uintptr_t poll_flags) {
     uintptr_t ret = 0;

@@ -631,7 +631,23 @@ if (THUMBYONE_SLOT_MODE)
         message(FATAL_ERROR "THUMBYONE_SLOT_MODE set but THUMBYONE_ROOT missing — "
                             "the parent ThumbyOne build must pass -DTHUMBYONE_ROOT=/path/to/ThumbyOne")
     endif()
-    target_compile_definitions(${MICROPY_TARGET} PRIVATE THUMBYONE_SLOT_MODE=1)
+    target_compile_definitions(${MICROPY_TARGET} PRIVATE
+        THUMBYONE_SLOT_MODE=1
+        # Lobby owns USB in ThumbyOne. The MPY slot never enumerates
+        # — no MSC, no CDC REPL. This saves ~8-10 KB of SRAM that
+        # tinyUSB's device stack would otherwise claim, and guarantees
+        # the shared FAT can only be written by exactly one thing at
+        # a time (the lobby when plugged in, the slot when running).
+        MICROPY_HW_ENABLE_USBDEV=0
+        MICROPY_HW_USB_MSC=0
+        # os.dupterm / dupterm_notify need a host REPL source to
+        # wire stdin against; with no CDC or UART REPL the
+        # stdin_ringbuf symbol doesn't exist, and os_dupterm.c won't
+        # link. Disable the API entirely under slot mode — games
+        # have no business redirecting the (non-existent) REPL anyway.
+        MICROPY_PY_OS_DUPTERM=0
+        MICROPY_PY_OS_DUPTERM_NOTIFY=0
+    )
 
     # Override the Tiny Game Engine's flash resource scratch region
     # so it stays inside the MPY partition instead of clobbering the
