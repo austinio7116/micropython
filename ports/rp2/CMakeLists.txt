@@ -706,9 +706,13 @@ if (THUMBYONE_SLOT_MODE)
         ${THUMBYONE_ROOT}/common/fs/thumbyone_disk.c
         ${THUMBYONE_ROOT}/common/fs/thumbyone_fs.c
         # picker UI (LCD/font/picker + BMP loader for game icons)
+        # menu_watchdog installs a background MENU-long-hold →
+        # lobby-reboot timer so MPY games can be exited even though
+        # they own the foreground LCD + button polling.
         ${THUMBYONE_ROOT}/common/picker/lcd_gc9107.c
         ${THUMBYONE_ROOT}/common/picker/font.c
         ${THUMBYONE_ROOT}/common/picker/picker_bmp.c
+        ${THUMBYONE_ROOT}/common/picker/menu_watchdog.c
         ${THUMBYONE_ROOT}/common/picker/picker.c
         # /system/ ROM VFS
         ${MICROPY_PORT_DIR}/thumbyone_rom_vfs.c
