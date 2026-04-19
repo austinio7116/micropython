@@ -716,6 +716,9 @@ if (THUMBYONE_SLOT_MODE)
         ${THUMBYONE_ROOT}/common/picker/picker.c
         # shared battery helper (used by picker menu info row)
         ${THUMBYONE_ROOT}/common/lib/thumbyone_battery.c
+        # shared shared-FAT disk-usage helper (used by picker menu
+        # info row to match lobby / NES / P8 readouts exactly)
+        ${THUMBYONE_ROOT}/common/lib/thumbyone_fs_stats.c
         # /system/ ROM VFS
         ${MICROPY_PORT_DIR}/thumbyone_rom_vfs.c
         ${THUMBYONE_SYSTEM_GEN_C}
