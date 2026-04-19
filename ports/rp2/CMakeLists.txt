@@ -719,6 +719,10 @@ if (THUMBYONE_SLOT_MODE)
         # shared shared-FAT disk-usage helper (used by picker menu
         # info row to match lobby / NES / P8 readouts exactly)
         ${THUMBYONE_ROOT}/common/lib/thumbyone_fs_stats.c
+        # shared hardware-PWM backlight driver (GP7 slice 3B)
+        ${THUMBYONE_ROOT}/common/lib/thumbyone_backlight.c
+        # shared system-wide settings (/.volume + /.brightness)
+        ${THUMBYONE_ROOT}/common/lib/thumbyone_settings.c
         # /system/ ROM VFS
         ${MICROPY_PORT_DIR}/thumbyone_rom_vfs.c
         ${THUMBYONE_SYSTEM_GEN_C}
