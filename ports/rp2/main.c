@@ -216,8 +216,22 @@ int main(int argc, char **argv) {
          * and execs /games/<name>/main.py. If the active-game file
          * is missing (picker didn't write one, or the game deleted
          * it to return to picker-on-next-boot), the launcher falls
-         * through to the normal REPL path. */
+         * through.
+         *
+         * When the launcher returns — whether because the game ran
+         * to completion, the user called sys.exit(), or an
+         * uncaught exception propagated out — DON'T fall through
+         * to pyexec_friendly_repl below. The MPY slot has no USB
+         * CDC (lobby owns USB), so the REPL's stdin read blocks
+         * forever and the device looks hung. Instead, trigger a
+         * watchdog reboot. The linker-wrapped watchdog_reboot sets
+         * the handoff scratch to THUMBYONE_SLOT_MPY so we come
+         * back into the C picker, giving the user a clean "game
+         * ended → back to the picker" flow. */
         pyexec_frozen_module("thumbyone_launcher.py", false);
+        extern void watchdog_reboot(uint32_t pc, uint32_t sp, uint32_t delay_ms);
+        watchdog_reboot(0, 0, 0);
+        while (1) { __asm__ volatile("wfe"); }
         #endif
 
         // Execute user scripts.
