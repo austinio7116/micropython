@@ -714,6 +714,8 @@ if (THUMBYONE_SLOT_MODE)
         ${THUMBYONE_ROOT}/common/picker/picker_bmp.c
         ${THUMBYONE_ROOT}/common/picker/menu_watchdog.c
         ${THUMBYONE_ROOT}/common/picker/picker.c
+        # shared battery helper (used by picker menu info row)
+        ${THUMBYONE_ROOT}/common/lib/thumbyone_battery.c
         # /system/ ROM VFS
         ${MICROPY_PORT_DIR}/thumbyone_rom_vfs.c
         ${THUMBYONE_SYSTEM_GEN_C}
@@ -730,6 +732,7 @@ if (THUMBYONE_SLOT_MODE)
         ${THUMBYONE_ROOT}/common
         ${THUMBYONE_ROOT}/common/fs
         ${THUMBYONE_ROOT}/common/picker
+        ${THUMBYONE_ROOT}/common/lib
         # common/fs/thumbyone_diskio.c + thumbyone_fs.c include
         # "ff.h" bare, so FatFs headers need to be on the include
         # path directly (not just at "lib/fatfs/ff.h" like vfs_fat
