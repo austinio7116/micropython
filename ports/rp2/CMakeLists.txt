@@ -654,15 +654,24 @@ if (THUMBYONE_SLOT_MODE)
 
     # Override the Tiny Game Engine's flash resource scratch region
     # so it stays inside the MPY partition instead of clobbering the
-    # sibling slots (NES at 0x20000 + P8 + DOOM live below the MPY
-    # image). MPY partition: 0x420000..0x620000 (2 MiB). Reserve the
-    # upper 768 KiB for scratch (base 0x560000), leaving 1.25 MiB
-    # for firmware growth. PICO_FLASH_SIZE_BYTES is the whole chip,
-    # so we don't use the engine's default formula here.
-    target_compile_definitions(${MICROPY_TARGET} PRIVATE
-        FLASH_RESOURCE_SPACE_BASE=0x560000u
-        FLASH_RESOURCE_SPACE_SIZE=0xC0000u
-    )
+    # sibling slots. Layout depends on THUMBYONE_WITH_MD:
+    #   MD off: MPY = 0x420000..0x620000 (2 MiB)  → scratch base 0x560000
+    #   MD on:  MPY = 0x520000..0x720000 (2 MiB)  → scratch base 0x660000
+    # Either way we reserve the upper 768 KiB of the MPY partition for
+    # engine resource scratch, leaving 1.25 MiB for firmware growth.
+    # PICO_FLASH_SIZE_BYTES is the whole chip, so the engine's default
+    # formula (END_OF_CHIP - FAT_SIZE) does not work here.
+    if (THUMBYONE_WITH_MD)
+        target_compile_definitions(${MICROPY_TARGET} PRIVATE
+            FLASH_RESOURCE_SPACE_BASE=0x660000u
+            FLASH_RESOURCE_SPACE_SIZE=0xC0000u
+        )
+    else()
+        target_compile_definitions(${MICROPY_TARGET} PRIVATE
+            FLASH_RESOURCE_SPACE_BASE=0x560000u
+            FLASH_RESOURCE_SPACE_SIZE=0xC0000u
+        )
+    endif()
 
     # /system/ ROM VFS — pack the engine's filesystem/system/ tree
     # into a C blob + entry table at build time, then compile it
