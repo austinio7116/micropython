@@ -633,6 +633,9 @@ if (THUMBYONE_SLOT_MODE)
     endif()
     target_compile_definitions(${MICROPY_TARGET} PRIVATE
         THUMBYONE_SLOT_MODE=1
+        # Propagate WITH_MD so mpconfigboard.h picks the right FAT
+        # base + size (0x660000/9.6MB vs 0x760000/8.6MB).
+        THUMBYONE_WITH_MD=${THUMBYONE_WITH_MD}
         # Lobby owns USB in ThumbyOne. The MPY slot never enumerates
         # — no MSC, no CDC REPL. This saves ~8-10 KB of SRAM that
         # tinyUSB's device stack would otherwise claim, and guarantees
@@ -721,6 +724,8 @@ if (THUMBYONE_SLOT_MODE)
         ${THUMBYONE_ROOT}/common/lib/thumbyone_fs_stats.c
         # shared hardware-PWM backlight driver (GP7 slice 3B)
         ${THUMBYONE_ROOT}/common/lib/thumbyone_backlight.c
+        # shared front-RGB-indicator driver (GP10/11/12, brightness-scaled)
+        ${THUMBYONE_ROOT}/common/lib/thumbyone_led.c
         # shared system-wide settings (/.volume + /.brightness)
         ${THUMBYONE_ROOT}/common/lib/thumbyone_settings.c
         # /system/ ROM VFS
