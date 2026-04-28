@@ -151,6 +151,8 @@ def _fps_draw_digit(fb: ptr16, font: ptr8, digit: int, x0: int, y0: int):
         col += 1
 
 def _draw_fps_overlay():
+    if not _fps_enabled:
+        return
     if not _fps_font_ok:
         return
     fps_f = engine.get_running_fps()
@@ -175,25 +177,36 @@ def _draw_fps_overlay():
             break
 
 # Scale state — fixed for the lifetime of the slot run. The lobby
-# writes a single global scale factor (a float, e.g. "1.75\n") to
-# /.legacy_scale before booting the MPY slot; we read it once here and
-# never change it at runtime. Defaults to 1.0 (pixel-perfect 72×40
-# centered) when the file is missing or malformed. Runtime LB/RB
-# scaling has been removed: the lobby is a better home for this
-# preference because (a) it has UI capacity the legacy game lacks,
-# (b) it persists naturally with the lobby's other settings, and
-# (c) LB/RB no longer collides with legacy game input.
+# writes a preset index (0..4 as ASCII "0".."4") to /.legacy_scale
+# before booting the MPY slot; we read it once here and never change
+# it at runtime. Defaults to preset 0 (1.0x, pixel-perfect 72×40
+# centered) when the file is missing or malformed.
+_SCALE_PRESETS = (1.0, 1.5, 1.75, 2.0, 2.5)
+
 def _read_active_scale():
     try:
         with open("/.legacy_scale") as f:
-            v = float(f.read().strip())
-        if v < 0.5: v = 0.5    # below 0.5x is unreadable
-        if v > 3.2: v = 3.2    # above ~3.2 either axis exceeds 128
-        return v
+            idx = int(f.read().strip())
+        if 0 <= idx < len(_SCALE_PRESETS):
+            return _SCALE_PRESETS[idx]
     except (OSError, ValueError):
-        return 1.0
+        pass
+    return _SCALE_PRESETS[0]
 
 _scale = _read_active_scale()
+
+# FPS overlay toggle — controlled by lobby. /.legacy_fps == "1"
+# means "show", anything else (file missing, "0", garbage) means
+# "hide". Default off so the bezel stays clean for users who don't
+# care about the diagnostic readout.
+def _read_fps_enabled():
+    try:
+        with open("/.legacy_fps") as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False
+
+_fps_enabled = _read_fps_enabled()
 
 # LUTs map output (post-scale) coordinates → source (pre-scale)
 # coordinates. Built once at import and never changed — the per-frame
