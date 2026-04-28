@@ -172,15 +172,74 @@ MP_DEFINE_CONST_OBJ_TYPE(
 
 /* -------- VFS object ----------------------------------------------- */
 
+/* Optional path-prefix support: an instance constructed with a string
+ * argument prepends that prefix to every incoming path before looking
+ * it up in the blob, so the same ROM blob can be mounted at multiple
+ * mount points with different views of its tree. _boot_fat.py uses
+ * this to expose /system/lib as /lib for legacy Thumby games that
+ * hard-code paths like "/lib/font5x7.bin" — without the prefix arg
+ * the class behaves exactly as before. */
 typedef struct _tbyone_rom_vfs_obj_t {
     mp_obj_base_t base;
+    char   path_prefix[64];   /* normalised; empty string = no prefix */
+    size_t path_prefix_len;
 } tbyone_rom_vfs_obj_t;
 
 extern const mp_obj_type_t tbyone_rom_vfs_type;
 
+/* Build (path_prefix + path) into out_buf. Returns out_buf on success,
+ * NULL on overflow. Empty prefix is a straight copy. Both prefix and
+ * path are expected to start with '/'. */
+static const char *prefix_path(const tbyone_rom_vfs_obj_t *self,
+                               const char *path, char *out, size_t out_size) {
+    size_t plen = strlen(path);
+    if (self->path_prefix_len == 0) {
+        if (plen + 1 > out_size) return NULL;
+        memcpy(out, path, plen + 1);
+        return out;
+    }
+    /* Bare-root incoming path collapses to just the prefix. */
+    if (plen == 1 && path[0] == '/') {
+        if (self->path_prefix_len + 1 > out_size) return NULL;
+        memcpy(out, self->path_prefix, self->path_prefix_len + 1);
+        return out;
+    }
+    /* prefix + path. If path doesn't start with '/' we insert one. */
+    size_t need = self->path_prefix_len + plen + 1;
+    if (path[0] != '/') need += 1;
+    if (need > out_size) return NULL;
+    memcpy(out, self->path_prefix, self->path_prefix_len);
+    char *cur = out + self->path_prefix_len;
+    if (path[0] != '/') *cur++ = '/';
+    memcpy(cur, path, plen + 1);
+    return out;
+}
+
 static mp_obj_t rom_vfs_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args) {
-    (void)n_args; (void)n_kw; (void)args;
+    mp_arg_check_num(n_args, n_kw, 0, 1, false);
     tbyone_rom_vfs_obj_t *self = mp_obj_malloc(tbyone_rom_vfs_obj_t, type);
+    self->path_prefix[0]  = 0;
+    self->path_prefix_len = 0;
+    if (n_args == 1) {
+        const char *p = mp_obj_str_get_str(args[0]);
+        size_t n = strlen(p);
+        if (n == 0 || p[0] != '/') {
+            mp_raise_ValueError(MP_ERROR_TEXT("prefix must start with '/'"));
+        }
+        /* Strip trailing '/' (but preserve bare "/" — that's a no-op
+         * prefix, so just clamp to empty). */
+        while (n > 1 && p[n - 1] == '/') n--;
+        if (n == 1) {
+            /* "/" prefix: same as empty. */
+        } else {
+            if (n >= sizeof(self->path_prefix)) {
+                mp_raise_ValueError(MP_ERROR_TEXT("prefix too long"));
+            }
+            memcpy(self->path_prefix, p, n);
+            self->path_prefix[n]  = 0;
+            self->path_prefix_len = n;
+        }
+    }
     return MP_OBJ_FROM_PTR(self);
 }
 
@@ -198,7 +257,7 @@ static mp_obj_t rom_vfs_umount(mp_obj_t self_in) {
 static MP_DEFINE_CONST_FUN_OBJ_1(rom_vfs_umount_obj, rom_vfs_umount);
 
 static mp_obj_t rom_vfs_open(mp_obj_t self_in, mp_obj_t path_in, mp_obj_t mode_in) {
-    (void)self_in;
+    tbyone_rom_vfs_obj_t *self = MP_OBJ_TO_PTR(self_in);
     const char *path = mp_obj_str_get_str(path_in);
     const char *mode = mp_obj_str_get_str(mode_in);
 
@@ -209,7 +268,11 @@ static mp_obj_t rom_vfs_open(mp_obj_t self_in, mp_obj_t path_in, mp_obj_t mode_i
         }
     }
 
-    const tbyone_rom_entry_t *e = find_entry(path);
+    char buf[128];
+    const char *full = prefix_path(self, path, buf, sizeof(buf));
+    if (full == NULL) mp_raise_OSError(MP_EINVAL);
+
+    const tbyone_rom_entry_t *e = find_entry(full);
     if (e == NULL || e->type != 0) {
         mp_raise_OSError(MP_ENOENT);
     }
@@ -223,9 +286,12 @@ static mp_obj_t rom_vfs_open(mp_obj_t self_in, mp_obj_t path_in, mp_obj_t mode_i
 static MP_DEFINE_CONST_FUN_OBJ_3(rom_vfs_open_obj, rom_vfs_open);
 
 static mp_obj_t rom_vfs_stat(mp_obj_t self_in, mp_obj_t path_in) {
-    (void)self_in;
+    tbyone_rom_vfs_obj_t *self = MP_OBJ_TO_PTR(self_in);
     const char *path = mp_obj_str_get_str(path_in);
-    const tbyone_rom_entry_t *e = find_entry(path);
+    char buf[128];
+    const char *full = prefix_path(self, path, buf, sizeof(buf));
+    if (full == NULL) mp_raise_OSError(MP_EINVAL);
+    const tbyone_rom_entry_t *e = find_entry(full);
     if (e == NULL) mp_raise_OSError(MP_ENOENT);
 
     mp_obj_tuple_t *t = MP_OBJ_TO_PTR(mp_obj_new_tuple(10, NULL));
@@ -280,11 +346,15 @@ static mp_obj_t rom_ilistdir_iternext(mp_obj_t self_in) {
 }
 
 static mp_obj_t rom_vfs_ilistdir_func(size_t n_args, const mp_obj_t *args) {
-    (void)args;  /* we don't need self */
+    tbyone_rom_vfs_obj_t *self = MP_OBJ_TO_PTR(args[0]);
     const char *path = (n_args == 2) ? mp_obj_str_get_str(args[1]) : "/";
 
+    char prefixed[128];
+    const char *full = prefix_path(self, path, prefixed, sizeof(prefixed));
+    if (full == NULL) mp_raise_OSError(MP_EINVAL);
+
     char norm[128];
-    if (normalise_path(path, norm, sizeof(norm)) == NULL) {
+    if (normalise_path(full, norm, sizeof(norm)) == NULL) {
         mp_raise_OSError(MP_EINVAL);
     }
 
@@ -330,8 +400,11 @@ static MP_DEFINE_CONST_FUN_OBJ_2(rom_vfs_rofs2_obj, rom_vfs_rofs);
 static MP_DEFINE_CONST_FUN_OBJ_1(rom_vfs_rofs1_obj, rom_vfs_rofs1);
 
 static mp_import_stat_t rom_vfs_import_stat(void *self_in, const char *path) {
-    (void)self_in;
-    const tbyone_rom_entry_t *e = find_entry(path);
+    tbyone_rom_vfs_obj_t *self = (tbyone_rom_vfs_obj_t *)self_in;
+    char buf[128];
+    const char *full = prefix_path(self, path, buf, sizeof(buf));
+    if (full == NULL) return MP_IMPORT_STAT_NO_EXIST;
+    const tbyone_rom_entry_t *e = find_entry(full);
     if (e == NULL) return MP_IMPORT_STAT_NO_EXIST;
     return (e->type == 1) ? MP_IMPORT_STAT_DIR : MP_IMPORT_STAT_FILE;
 }

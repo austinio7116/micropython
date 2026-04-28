@@ -22,6 +22,13 @@ vfs.mount(fs, "/")
 try:
     import thumbyone_rom
     vfs.mount(thumbyone_rom.ThumbyOneRomVFS(), "/system", readonly=True)
+    # Legacy original-Thumby games hard-code paths like
+    # "/lib/font5x7.bin" via `thumby.display.setFont`. The font assets
+    # ship inside the same /system ROM blob (under /system/lib/), so
+    # mount the blob a second time at /lib with a "/lib" path prefix —
+    # `open("/lib/font5x7.bin")` then resolves to blob entry
+    # /lib/font5x7.bin without any FAT footprint.
+    vfs.mount(thumbyone_rom.ThumbyOneRomVFS("/lib"), "/lib", readonly=True)
     del thumbyone_rom
 except ImportError:
     pass
