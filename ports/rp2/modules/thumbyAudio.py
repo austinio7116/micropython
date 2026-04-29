@@ -92,14 +92,17 @@ class AudioClass:
         import engine_audio as _eng_audio
         @micropython.native
         def _scaled_duty(self):
-            # ThumbyOne lobby exposes volume in 21 discrete steps
-            # (0/20 .. 20/20) → engine_audio.get_volume() returns 0.0,
-            # 0.05, 0.10, ..., 1.0. Linear scaling of the PWM duty
-            # cycle sounds binary because (a) the buzzer-amp's audible
-            # amplitude saturates well below 50 % duty and (b) human
-            # loudness perception is roughly logarithmic. A cubic
-            # mapping spreads the audible range across the slider so
-            # mid-positions actually sound mid-loud.
+            # ThumbyOne lobby exposes volume in 21 discrete steps via
+            # engine_audio.get_volume() (0.0..1.0). Cube scaling so the
+            # slider's mid-range produces audibly mid-range volume —
+            # legacy tone audio drives the buzzer / class-D amp into
+            # near-saturation by ~30 % duty, so a linear duty law would
+            # feel like "max from 30 % onward". Cube biases the curve so
+            # mid-positions of the slider land in the audibly distinct
+            # range. PCM streaming games (BadApple) bypass this module
+            # entirely and use the launcher's _LegacyBuzzerPwm shim,
+            # which detects PCM mode by frequency and applies a
+            # different (linear, centred) law.
             v = self._eng_audio.get_volume()
             if v < 0.0: v = 0.0
             if v > 1.0: v = 1.0

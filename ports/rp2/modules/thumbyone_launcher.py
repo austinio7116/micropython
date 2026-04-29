@@ -202,13 +202,65 @@ def _run_active_game():
             class _LegacyButtonPin:
                 # Original Thumby buttons are active-low (pull-up,
                 # 0 == pressed). engine_io.X.is_pressed is True when
-                # the user is pressing it, so invert.
+                # the user is pressing it, so invert. _eio_for_pin
+                # is captured via closure from the enclosing
+                # function — works fine for regular instance methods
+                # in MicroPython (the static-method case in the PWM
+                # shim is what fails).
                 def __init__(self, btn): self._btn = btn
                 def value(self, *args):
                     _eio_for_pin.update_buttons()
                     return 0 if self._btn.is_pressed else 1
                 def init(self, *args, **kwargs): pass
                 def irq(self, *args, **kwargs): return None
+
+            # Pin numbers that legacy games access for non-button
+            # purposes BUT which collide with Color hardware we must
+            # not let them reconfigure. Each one returns an inert
+            # _NoopPin so the hardware GPIO stays as the engine
+            # configured it.
+            #
+            #   GPIO 0..2  — original Thumby's UART link-cable pins
+            #                (Umby&Glow's comms.py, RocketCup's link
+            #                code). On Color these are wired to D-pad
+            #                LEFT (0), UP (1), RIGHT (2) — letting
+            #                the game reconfigure them as OUT bricks
+            #                three of the four D-pad buttons.
+            _LEGACY_BLOCK_PINS = (0, 1, 2)
+
+            # Sentinel returned by Pin(28) so PWM(Pin(28)) can detect
+            # the buzzer pattern reliably. We can't use `int(pin)`
+            # for detection because real machine.Pin doesn't reliably
+            # implement __int__ (returns gpio level on some ports).
+            class _BuzzerPinSentinel:
+                """Quacks like a Pin enough that legacy games which
+                construct PWM around it work transparently. Holds no
+                hardware claim — the underlying audio output happens
+                via thumbyAudio's existing pin-23 PWM."""
+                def value(self, *args): return 0
+                def init(self, *args, **kwargs): pass
+                def irq(self, *args, **kwargs): return None
+                def on(self, *args): pass
+                def off(self, *args): pass
+                def low(self): pass
+                def high(self): pass
+                def toggle(self): pass
+            _BUZZER_PIN = _BuzzerPinSentinel()
+
+            class _NoopPin:
+                """Inert Pin wrapper for hardware-conflicting
+                original-Thumby pins (link cable on 0/1/2). Pretends
+                to be a Pin but never touches hardware."""
+                def __init__(self, *args, **kwargs): pass
+                def value(self, *args): return 0
+                def init(self, *args, **kwargs): pass
+                def irq(self, *args, **kwargs): return None
+                def on(self, *args): pass
+                def off(self, *args): pass
+                def low(self): pass
+                def high(self): pass
+                def toggle(self): pass
+
             class _PinShim:
                 IN        = _real_pin_class.IN
                 OUT       = _real_pin_class.OUT
@@ -219,12 +271,192 @@ def _run_active_game():
                         if pin_id not in _LEGACY_BTN_CACHE:
                             _LEGACY_BTN_CACHE[pin_id] = _LegacyButtonPin(_LEGACY_BTN_MAP[pin_id])
                         return _LEGACY_BTN_CACHE[pin_id]
+                    if pin_id == 28:
+                        return _BUZZER_PIN
+                    if pin_id in _LEGACY_BLOCK_PINS:
+                        return _NoopPin()
                     return _real_pin_class(pin_id, *args, **kwargs)
+            # PWM shim. Original-Thumby buzzer is on GPIO 28 — eight
+            # legacy games (Umby & Glow audio, BadApple, PSdemo,
+            # TinyFreddy, MicroMeows, Thexecutor, Journey3Dg's
+            # musicplayer, Bowling Days) do `_spkr = PWM(Pin(28))`
+            # then drive freq/duty_u16 on it. On Color, GPIO 28 is
+            # unconnected and the buzzer moved to GPIO 23 (claimed by
+            # the engine's audio path). When a legacy game asks for
+            # `PWM(Pin(28))`, redirect to the existing PWM the
+            # frozen thumbyAudio module already created on pin 23 so
+            # the same freq/duty calls actually produce sound, with
+            # cubic volume scaling matching the lobby's volume slider.
+            _real_pwm_class = _real_machine.PWM
+            # Capture the modules we need at construction time. Closure
+            # works for the regular instance methods below; the C
+            # built-in modules engine_io / engine_audio are NOT in
+            # sys.modules (mp_module_get_builtin returns them directly
+            # without populating the dict), so we MUST capture by
+            # reference here, not look them up later.
+            try:
+                import thumbyAudio as _tha_for_pwm
+            except Exception:
+                _tha_for_pwm = None
+            try:
+                import engine_audio as _eng_audio_for_pwm
+            except Exception:
+                _eng_audio_for_pwm = None
+            # Mutable state for the legacy PWM shim. Module-level dict
+            # so we don't rely solely on closure capture (which has
+            # been historically flaky for class methods defined inside
+            # a function on this MicroPython fork — see the static-
+            # method note below). Holds the engine_audio module ref
+            # once we've loaded it, plus diagnostic counters.
+            _legacy_pwm_state = {
+                'eng_audio': None,
+                'eng_audio_tried': False,
+            }
+            class _LegacyBuzzerPwm:
+                # Forward to thumbyAudio's pin-23 PWM. Two scaling
+                # regimes depending on what the underlying PWM is doing:
+                #
+                #  * Tone mode (audible PWM carrier, < 20 kHz): the PWM
+                #    cycle IS the audio. Duty cycle controls amplitude
+                #    of the tone. Class-D amp + buzzer response is non-
+                #    linear, so use cube scaling on volume — without it,
+                #    even mid-slider feels indistinguishable from max.
+                #    Used by Umby & Glow, CosmicSurvivor, and most other
+                #    legacy games that play tones via PWM(Pin(28)).
+                #
+                #  * PCM mode (carrier >= 20 kHz, currently only set
+                #    when a game does thumby.audio.set(80000) before
+                #    streaming samples): duty IS the audio sample.
+                #    Re-centre around 50 % duty so the swing stays in
+                #    the class-D amp's linear region (instead of
+                #    railing 0 % / 100 %). Volume attenuates the swing
+                #    toward the silent midpoint. Used by BadApple.
+                #
+                # We detect mode by querying the underlying PWM's
+                # current frequency on each duty write. The query is a
+                # single register read (~< 1 µs) and BadApple's audio
+                # rate is 8 kHz, so the overhead is ~8 ms/sec — fine.
+                #
+                # Instance methods (NOT @staticmethod) — closure capture
+                # of the enclosing-function locals (e.g. _tha_for_pwm)
+                # was empirically broken for static methods defined in
+                # a class defined inside a function on this MicroPython
+                # fork. Instance methods work.
+                def freq(self, f):
+                    if _tha_for_pwm is None: return
+                    try: _tha_for_pwm.audio.pwm.freq(f)
+                    except Exception: pass
+                def duty_u16(self, d):
+                    if _tha_for_pwm is None: return
+                    try:
+                        pwm = _tha_for_pwm.audio.pwm
+                        # Lazy-load engine_audio. We don't trust the
+                        # outer closure import here because the user
+                        # has hit closure-capture failures on this
+                        # exact pattern before. A module-level dict
+                        # for state is more reliable than a closure cell.
+                        if not _legacy_pwm_state['eng_audio_tried']:
+                            _legacy_pwm_state['eng_audio_tried'] = True
+                            try:
+                                import engine_audio as _ea
+                                _legacy_pwm_state['eng_audio'] = _ea
+                            except Exception:
+                                _legacy_pwm_state['eng_audio'] = None
+                        ea = _legacy_pwm_state['eng_audio']
+                        v = 1.0
+                        if ea is not None:
+                            v = ea.get_volume()
+                            if v < 0.0: v = 0.0
+                            if v > 1.0: v = 1.0
+                        try:
+                            cur_freq = pwm.freq()
+                        except Exception:
+                            cur_freq = 0
+                        if cur_freq >= 20000:
+                            # PCM mode — re-centre input around 0x8000
+                            # (50 % duty) with v-attenuated swing.
+                            # input 0..0xFFFF → centred 0x4000..0xC000
+                            centred = 0x4000 + (d >> 1)
+                            d = 0x8000 + int((centred - 0x8000) * v)
+                        else:
+                            # Tone mode — cube scaling for perceptual
+                            # response across the slider range.
+                            d = int(d * v * v * v)
+                        pwm.duty_u16(d)
+                    except Exception: pass
+                def deinit(self): pass
+                def init(self, *args, **kwargs): pass
+            _BUZZER_PWM_INSTANCE = _LegacyBuzzerPwm()
+            class _PwmShim:
+                def __new__(cls, pin_obj, *args, **kwargs):
+                    # PWM(Pin(28)) — Pin shim returned _BUZZER_PIN
+                    # (singleton sentinel) for pin id 28, so we can
+                    # detect the buzzer-PWM pattern by identity check
+                    # without relying on machine.Pin's int conversion
+                    # (which is unreliable across ports — sometimes
+                    # returns the GPIO level instead of the pin id).
+                    if pin_obj is _BUZZER_PIN:
+                        return _BUZZER_PWM_INSTANCE
+                    return _real_pwm_class(pin_obj, *args, **kwargs)
+
+            # UART shim. Original-Thumby uses UART(0) on pins 0/1 for
+            # the link-cable. Color has no equivalent (engine_link
+            # uses USB CDC). Provide a no-op UART class so games that
+            # try to multiplayer don't crash; single-player still
+            # works. Only RocketCup and Umby & Glow's comms.py care.
+            _real_uart_class = getattr(_real_machine, 'UART', None)
+            class _LegacyUart:
+                def __init__(self, *args, **kwargs): pass
+                def init(self, *args, **kwargs): pass
+                def deinit(self, *args, **kwargs): pass
+                def read(self, *args, **kwargs): return None
+                def readinto(self, buf, *args, **kwargs): return 0
+                def readline(self): return None
+                def write(self, data, *args, **kwargs):
+                    try: return len(data)
+                    except TypeError: return 0
+                def any(self): return 0
+                def txdone(self): return True
+            class _UartShim:
+                def __new__(cls, *args, **kwargs):
+                    # Always return a no-op UART for legacy games.
+                    # No real link-cable hardware to talk to anyway.
+                    return _LegacyUart()
+
             class _MachineShim:
                 Pin = _PinShim
+                PWM = _PwmShim
+                UART = _UartShim if _real_uart_class is not None else None
                 def __getattr__(self, name):
                     return getattr(_real_machine, name)
             sys.modules['machine'] = _MachineShim()
+
+            # Some original-Thumby games (TinyGolf is the canonical
+            # example) bypass thumbyButton entirely and access the raw
+            # `swL` / `swR` / `swU` / `swD` / `swA` / `swB` Pin objects
+            # exposed by the upstream thumbyHardware module on the
+            # original-Thumby code path. The Color path of
+            # thumbyHardware doesn't define those (only swBuzzer +
+            # reset), so any access raises AttributeError. Backfill
+            # them here using our _LegacyButtonPin instances so games
+            # that read e.g. `thumbyHardware.swL.value()` get the same
+            # engine_io-backed wrapper as `Pin(3).value()`.
+            try:
+                if 'thumbyHardware' in sys.modules:
+                    _th = sys.modules['thumbyHardware']
+                    def _btn_for(pin_id):
+                        if pin_id not in _LEGACY_BTN_CACHE:
+                            _LEGACY_BTN_CACHE[pin_id] = _LegacyButtonPin(_LEGACY_BTN_MAP[pin_id])
+                        return _LEGACY_BTN_CACHE[pin_id]
+                    _th.swL = _btn_for(3)
+                    _th.swR = _btn_for(5)
+                    _th.swU = _btn_for(4)
+                    _th.swD = _btn_for(6)
+                    _th.swA = _btn_for(27)
+                    _th.swB = _btn_for(24)
+                    del _btn_for, _th
+            except Exception as _th_e:
+                _write_last_error("thumbyHardware sw* augmentation failed:\n", _th_e)
         except Exception as _pin_e:
             _write_last_error("Pin shim install failed:\n", _pin_e)
 

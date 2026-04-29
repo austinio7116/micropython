@@ -41,6 +41,7 @@ IS_THUMBY_COLOR = "TinyCircuits Thumby Color" in sys.implementation._machine
 import engine_main  # noqa: F401
 import engine
 import engine_draw
+import engine_io
 from engine_resources import TextureResource
 
 # fps_limit chosen large enough to never gate display.update() — the
@@ -176,24 +177,28 @@ def _draw_fps_overlay():
         if n == 0 and drew_any:
             break
 
-# Scale state — fixed for the lifetime of the slot run. The lobby
-# writes a preset index (0..4 as ASCII "0".."4") to /.legacy_scale
-# before booting the MPY slot; we read it once here and never change
-# it at runtime. Defaults to preset 0 (1.0x, pixel-perfect 72×40
-# centered) when the file is missing or malformed.
+# Scale state — initial value comes from the lobby's persisted preset
+# (ASCII "0".."4" in /.legacy_scale). At runtime, a quick MENU tap
+# inside present_*() advances to the next preset (5-cycle wrap). The
+# in-session change is NOT written back to /.legacy_scale — the lobby
+# menu remains the single source of truth for the persisted default,
+# so the next game launch always honours whatever the user picked
+# there. Defaults to preset 0 (1.0x, pixel-perfect 72×40 centered)
+# when the file is missing or malformed.
 _SCALE_PRESETS = (1.0, 1.5, 1.75, 2.0, 2.5)
 
-def _read_active_scale():
+def _read_active_scale_idx():
     try:
         with open("/.legacy_scale") as f:
             idx = int(f.read().strip())
         if 0 <= idx < len(_SCALE_PRESETS):
-            return _SCALE_PRESETS[idx]
+            return idx
     except (OSError, ValueError):
         pass
-    return _SCALE_PRESETS[0]
+    return 0
 
-_scale = _read_active_scale()
+_scale_idx = _read_active_scale_idx()
+_scale = _SCALE_PRESETS[_scale_idx]
 
 # FPS overlay toggle — controlled by lobby. /.legacy_fps == "1"
 # means "show", anything else (file missing, "0", garbage) means
@@ -255,6 +260,34 @@ def _apply_scale():
     _shadow_clear_black(_fb)
 
 _apply_scale()
+
+
+# Quick MENU tap inside the per-frame present_*() entry points cycles
+# through _SCALE_PRESETS. Adds zero extra ticks / renders: the check
+# happens AFTER engine.tick() using button state the tick already
+# refreshed. The 5 s MENU-hold-to-lobby watchdog in common/picker/
+# menu_watchdog.c polls GPIO 26 directly in a C timer and only fires
+# on contiguous holds, so a tap here can't trigger it.
+#
+# We MUST NOT use engine_io.MENU.is_just_pressed here. Legacy games
+# poll buttons via the launcher's Pin shim (thumbyone_launcher.py
+# _LegacyButtonPin.value), which calls engine_io.update_buttons() on
+# every Pin().value() — and update_buttons() rotates prev_pressed
+# forward each call (engine_io_buttons.c:73). After 6 button polls in
+# the game's main loop, the edge bit is consumed and "just_pressed"
+# is False by the time we check, even though MENU was clearly tapped.
+# Use is_pressed (level state — true for the whole hold) and compute
+# the edge between frames in Python instead.
+_menu_was_pressed = False
+
+def _cycle_scale_if_menu_tapped():
+    global _menu_was_pressed, _scale_idx, _scale
+    pressed_now = engine_io.MENU.is_pressed
+    if pressed_now and not _menu_was_pressed:
+        _scale_idx = (_scale_idx + 1) % len(_SCALE_PRESETS)
+        _scale = _SCALE_PRESETS[_scale_idx]
+        _apply_scale()
+    _menu_was_pressed = pressed_now
 
 
 # --- Viper render kernels -------------------------------------------
@@ -367,6 +400,7 @@ def present_mono(buffer):
     _draw_fps_overlay()
     _shadow_blit_to_back(_fb, _back_fb_data)
     engine.tick()
+    _cycle_scale_if_menu_tapped()
 
 
 def present_gray(buffer, shading):
@@ -379,3 +413,4 @@ def present_gray(buffer, shading):
     _draw_fps_overlay()
     _shadow_blit_to_back(_fb, _back_fb_data)
     engine.tick()
+    _cycle_scale_if_menu_tapped()

@@ -1721,18 +1721,25 @@ static void emit_native_store_global(emit_t *emit, qstr qst, int kind) {
 }
 
 static void emit_native_store_attr(emit_t *emit, qstr qst) {
-    vtype_kind_t vtype_base;
-    vtype_kind_t vtype_val = peek_vtype(emit, 1);
-    if (vtype_val == VTYPE_PYOBJ) {
-        emit_pre_pop_reg_reg(emit, &vtype_base, REG_ARG_1, &vtype_val, REG_ARG_3); // arg1 = base, arg3 = value
-    } else {
-        emit_access_stack(emit, 2, &vtype_val, REG_ARG_1); // arg1 = value
-        emit_call_with_imm_arg(emit, MP_F_CONVERT_NATIVE_TO_OBJ, vtype_val, REG_ARG_2); // arg2 = type
-        ASM_MOV_REG_REG(emit->as, REG_ARG_3, REG_RET); // arg3 = value (converted)
-        emit_pre_pop_reg(emit, &vtype_base, REG_ARG_1); // arg1 = base
-        adjust_stack(emit, -1); // pop value
-    }
+    // ThumbyOne: revert MicroPython 9714a0e (Jul 2022) so original-Thumby
+    // games written against MP 1.19.1 viper still work. That commit added
+    // a MP_F_CONVERT_NATIVE_TO_OBJ box on the value path, which breaks the
+    // hand-rolled small-int tag trick (`expr << 1 | 1`) Umby & Glow and
+    // similar games use to skip per-tick heap allocation. With the box
+    // removed, the raw 32-bit word is passed straight through to
+    // mp_store_attr as mp_obj_t — so a pre-tagged small int is stored as
+    // such, identically to MP 1.19.1 behaviour.
+    //
+    // Caveat: viper code that stores a non-PYOBJ even integer into an
+    // attribute will now corrupt the slot (the value is interpreted as a
+    // heap pointer). Idiomatic viper either uses `<<1|1` deliberately
+    // (legacy games) or stores Python objects via `int(...)` round-trip,
+    // so this is generally safe — but new viper attribute stores need to
+    // be aware of the constraint.
+    vtype_kind_t vtype_base, vtype_val;
+    emit_pre_pop_reg_reg(emit, &vtype_base, REG_ARG_1, &vtype_val, REG_ARG_3); // arg1 = base, arg3 = value
     assert(vtype_base == VTYPE_PYOBJ);
+    assert(vtype_val == VTYPE_PYOBJ);
     emit_call_with_qstr_arg(emit, MP_F_STORE_ATTR, qst, REG_ARG_2); // arg2 = attribute name
     emit_post(emit);
 }

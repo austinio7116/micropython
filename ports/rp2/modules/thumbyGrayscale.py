@@ -188,8 +188,18 @@ class Grayscale:
         self.max_x   = _WIDTH - 1
         self.max_y   = _HEIGHT - 1
 
-        # Frame-pacing state (used by update())
-        self.frameRate     = 0
+        # Frame-pacing state (used by update()). Default to 30 fps —
+        # original Thumby's grayscale library paces itself implicitly
+        # via the GPU thread's 3-subframe sync (~30 Hz aggregate),
+        # so games like Umby & Glow that don't call setFPS expect
+        # roughly that wall-clock rate. Without an explicit cap on
+        # Color, our show() runs at the full engine.tick() rate
+        # (~90 Hz), making every per-tick game-state increment land
+        # ~3x too fast — characters move all over, die instantly,
+        # successive frames flicker through faster than the eye can
+        # resolve into clean text. Games that DO call setFPS still
+        # override this (it's just a sane default).
+        self.frameRate     = 30
         self.lastUpdateEnd = 0
 
         # Default to grayscale enabled. Games typically call
