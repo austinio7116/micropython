@@ -652,6 +652,17 @@ if (THUMBYONE_SLOT_MODE)
         MICROPY_PY_OS_DUPTERM_NOTIFY=0
     )
 
+    # Forward the parent ThumbyOne build's firmware version string into
+    # the MPY-slot picker (and any other slot source that wants it).
+    # The parent CMakeLists.txt sets THUMBYONE_FW_VERSION as a single
+    # source of truth; we pass it through ExternalProject CMAKE_ARGS
+    # and turn it into a compile definition here. .c sources keep an
+    # inline #define fallback for standalone-build sanity.
+    if (DEFINED THUMBYONE_FW_VERSION)
+        target_compile_definitions(${MICROPY_TARGET} PRIVATE
+            THUMBYONE_FW_VERSION="${THUMBYONE_FW_VERSION}")
+    endif()
+
     # Override the Tiny Game Engine's flash resource scratch region
     # so it stays inside the MPY partition instead of clobbering the
     # sibling slots. Layout depends on THUMBYONE_WITH_MD:
