@@ -290,6 +290,153 @@ def _cycle_scale_if_menu_tapped():
     _menu_was_pressed = pressed_now
 
 
+# --- Screenshot capture (LB + RB chord, 1.11 addition) -----------------
+#
+# Original Thumby has no LB/RB buttons, so this chord can never collide
+# with legacy game input. Hold both shoulder buttons together for ~500
+# ms while the game is running and the current 128×128 shadow
+# framebuffer is box-averaged down to 64×64 and written as
+# `icon.bmp` (RGB565 BMP) into the running game's own folder.
+# The MPY picker reads icon.bmp from each game directory, so the
+# captured frame becomes the picker thumbnail on the next launcher
+# tick — same UX as ThumbyNES's MENU+A capture for ROMs.
+#
+# `os.chdir(game_dir)` was done by the launcher before the game's
+# `exec(main_py)`, so a plain `open("icon.bmp", "wb")` lands in the
+# right place.
+
+import time
+
+_SCREENSHOT_CHORD_HOLD_MS = const(500)
+_screenshot_chord_start_ms = 0  # 0 = chord not active
+_screenshot_just_taken = False
+_screenshot_flash_remaining = 0  # frames to draw the white-corner cue
+
+@micropython.viper
+def _box_avg_2x_rgb565(src: ptr16, dst: ptr16):
+    """Box-average a 128×128 RGB565 image down to 64×64 RGB565 in
+    the destination buffer. Each output pixel is the channel-wise
+    arithmetic mean of a 2×2 source block. Both buffers are flat
+    little-endian RGB565 (red in bits 15..11, green in 10..5, blue
+    in 4..0)."""
+    oy: int = 0
+    while oy < 64:
+        ox: int = 0
+        sy: int = oy << 1            # source row
+        row_a: int = sy * 128
+        row_b: int = (sy + 1) * 128
+        while ox < 64:
+            sx: int = ox << 1
+            p0: int = int(src[row_a + sx])
+            p1: int = int(src[row_a + sx + 1])
+            p2: int = int(src[row_b + sx])
+            p3: int = int(src[row_b + sx + 1])
+            # Sum 4 source pixels per channel (5-bit R, 6-bit G, 5-bit B).
+            r: int = ((p0 >> 11) & 0x1F) + ((p1 >> 11) & 0x1F) \
+                   + ((p2 >> 11) & 0x1F) + ((p3 >> 11) & 0x1F)
+            g: int = ((p0 >> 5)  & 0x3F) + ((p1 >> 5)  & 0x3F) \
+                   + ((p2 >> 5)  & 0x3F) + ((p3 >> 5)  & 0x3F)
+            b: int =  (p0        & 0x1F) +  (p1        & 0x1F) \
+                   +  (p2        & 0x1F) +  (p3        & 0x1F)
+            # Divide by 4 and repack.
+            dst[oy * 64 + ox] = ((r >> 2) << 11) | ((g >> 2) << 5) | (b >> 2)
+            ox += 1
+        oy += 1
+
+
+def _capture_screenshot():
+    """Save a 64×64 RGB565 BMP of the current shadow framebuffer to
+    `icon.bmp` in the current game directory. Best-effort — failures
+    are swallowed so the game keeps running."""
+    try:
+        # Downsample 128×128 → 64×64 in a fresh buffer.
+        thumb = bytearray(64 * 64 * 2)
+        _box_avg_2x_rgb565(_shadow.data, thumb)
+
+        # BMP V3 header (70 bytes total): 14-byte file header + 56-byte
+        # BITMAPV3INFOHEADER with BI_BITFIELDS R/G/B/A masks for RGB565.
+        IMG = 64 * 64 * 2
+        FILE_SIZE = 70 + IMG
+        h = bytearray(70)
+        # File header
+        h[0] = 0x42; h[1] = 0x4D                 # 'BM'
+        h[2] = FILE_SIZE & 0xFF
+        h[3] = (FILE_SIZE >> 8) & 0xFF
+        h[4] = (FILE_SIZE >> 16) & 0xFF
+        h[5] = (FILE_SIZE >> 24) & 0xFF
+        # bytes 6..9 reserved (zero)
+        h[10] = 70                               # data offset
+        # DIB header
+        h[14] = 56                               # header size
+        h[18] = 64                               # width
+        h[22] = 64                               # height (positive = bottom-up)
+        h[26] = 1                                # planes
+        h[28] = 16                               # bpp
+        h[30] = 3                                # compression = BI_BITFIELDS
+        h[34] = IMG & 0xFF                       # image byte size
+        h[35] = (IMG >> 8) & 0xFF
+        h[36] = (IMG >> 16) & 0xFF
+        # Channel masks (RGB565 little-endian)
+        h[54] = 0x00; h[55] = 0xF8               # red   = 0xF800
+        h[58] = 0xE0; h[59] = 0x07               # green = 0x07E0
+        h[62] = 0x1F                             # blue  = 0x001F
+        # bytes 66..69 (alpha mask) zero — RGB565 has no alpha
+
+        # Write BMP. Pixel rows are bottom-up; our buffer is top-down,
+        # so flip on write. Each row is 64*2=128 bytes, 4-byte aligned,
+        # no padding needed.
+        with open("icon.bmp", "wb") as f:
+            f.write(h)
+            for y in range(63, -1, -1):
+                f.write(thumb[y * 128:(y + 1) * 128])
+    except Exception:
+        # Don't let a transient FS error knock the game over.
+        pass
+
+
+def _check_screenshot_chord():
+    """Polled by present_*() each frame. LB+RB held continuously for
+    `_SCREENSHOT_CHORD_HOLD_MS` triggers a one-shot capture; releasing
+    either button before the threshold cancels."""
+    global _screenshot_chord_start_ms, _screenshot_just_taken, _screenshot_flash_remaining
+    lb = engine_io.LB.is_pressed
+    rb = engine_io.RB.is_pressed
+    chord = lb and rb
+    now = time.ticks_ms()
+    if chord:
+        if _screenshot_chord_start_ms == 0:
+            _screenshot_chord_start_ms = now if now != 0 else 1
+            _screenshot_just_taken = False
+        elif (not _screenshot_just_taken
+              and time.ticks_diff(now, _screenshot_chord_start_ms)
+                  >= _SCREENSHOT_CHORD_HOLD_MS):
+            _capture_screenshot()
+            _screenshot_just_taken = True
+            _screenshot_flash_remaining = 6  # ~6 frames of corner cue
+    else:
+        _screenshot_chord_start_ms = 0
+        _screenshot_just_taken = False
+
+
+@micropython.viper
+def _draw_screenshot_flash(fb: ptr16):
+    """Brief 8×8 white square in each corner of the framebuffer to
+    visually confirm a screenshot was just taken. Drawn for a few
+    frames after capture; ticks down via _screenshot_flash_remaining."""
+    y: int = 0
+    while y < 8:
+        x: int = 0
+        while x < 8:
+            row: int = y * 128
+            row_b: int = (120 + y) * 128
+            fb[row + x]            = 0xFFFF
+            fb[row + (120 + x)]    = 0xFFFF
+            fb[row_b + x]          = 0xFFFF
+            fb[row_b + (120 + x)]  = 0xFFFF
+            x += 1
+        y += 1
+
+
 # --- Viper render kernels -------------------------------------------
 #
 # All four kernels share the same source-bit unpack convention:
@@ -384,6 +531,16 @@ def _present_gray_scaled(buf: ptr8, shade: ptr8, fb: ptr16, pal: ptr16,
 
 # --- Public entry points --------------------------------------------
 
+def _present_post():
+    """Common post-tick housekeeping for both presenter entry points."""
+    global _screenshot_flash_remaining
+    if _screenshot_flash_remaining > 0:
+        _draw_screenshot_flash(_fb)
+        _screenshot_flash_remaining -= 1
+    _cycle_scale_if_menu_tapped()
+    _check_screenshot_chord()
+
+
 def present_mono(buffer):
     """Render a 1bpp MONO_VLSB 72×40 buffer + tick the engine.
 
@@ -400,7 +557,7 @@ def present_mono(buffer):
     _draw_fps_overlay()
     _shadow_blit_to_back(_fb, _back_fb_data)
     engine.tick()
-    _cycle_scale_if_menu_tapped()
+    _present_post()
 
 
 def present_gray(buffer, shading):
@@ -413,4 +570,4 @@ def present_gray(buffer, shading):
     _draw_fps_overlay()
     _shadow_blit_to_back(_fb, _back_fb_data)
     engine.tick()
-    _cycle_scale_if_menu_tapped()
+    _present_post()

@@ -273,12 +273,33 @@ mp_obj_t mp_obj_new_int_from_ull(unsigned long long val) {
 }
 
 mp_obj_t mp_obj_new_int_from_str_len(const char **str, size_t len, bool neg, unsigned int base) {
-    // TODO this does not honor the given length of the string, but it all cases it should anyway be null terminated
-    // TODO check overflow
+    // strtoll() has no length parameter — copy the slice to a small
+    // null-terminated stack buffer first so it can't overrun. The
+    // longest legitimate input is a 64-bit signed value in base 2,
+    // which is 64 digits + optional sign + null = 66 chars; allow
+    // 80 for slack. Inputs larger than that are nonsense (would
+    // overflow long long anyway), so we just clamp.
+    //
+    // ThumbyOne 1.11: this fixes a SyntaxError on 32-bit ports
+    // (rp2 / RP2350) when source code contains a hex literal that
+    // exceeds 30-bit small-int range — e.g. PSdemo.py uses
+    // `ptr32(0x40014000)` which lands in the overflow path here, and
+    // the un-bounded strtoll could read into adjacent vstr / heap
+    // bytes producing garbage and false "invalid syntax" errors.
+    char buf[80];
+    if (len >= sizeof(buf)) {
+        len = sizeof(buf) - 1;
+    }
+    memcpy(buf, *str, len);
+    buf[len] = '\0';
+
     char *endptr;
-    mp_obj_t result = mp_obj_new_int_from_ll(strtoll(*str, &endptr, base));
-    *str = endptr;
-    return result;
+    long long v = strtoll(buf, &endptr, base);
+    if (neg) {
+        v = -v;
+    }
+    *str = *str + (endptr - buf);
+    return mp_obj_new_int_from_ll(v);
 }
 
 mp_int_t mp_obj_int_get_truncated(mp_const_obj_t self_in) {

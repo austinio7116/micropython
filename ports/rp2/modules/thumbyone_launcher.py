@@ -167,6 +167,37 @@ def _run_active_game():
             _write_last_error("display.py shim install failed:\n", _shim_e)
     del _gs_mod
 
+    # Polysynth shim. Original-Thumby games PSdemo and TinyFreddy ship
+    # with a `polysynth.py` library that drives bare GPIOs (7, 8, 9,
+    # 10, 11, 21, 22, 25) via PIO state machines for 7-voice
+    # synthesis. On Color those GPIOs are claimed by the LCD backlight
+    # (7), RGB LED PWMs (10/11), and A/B/RB buttons (21/22/25); letting
+    # the upstream library run would brick the device while the song
+    # plays. Detect the bundled `polysynth.py` and override
+    # sys.modules['polysynth'] with our frozen software-emulated
+    # version BEFORE the game's first import resolves it. The bundled
+    # source therefore never gets parsed, no GPIO claims happen, and
+    # the game's `polysynth.setpitch` / `polysynth.play` calls land in
+    # the frozen shim which routes through engine_audio's 7-channel
+    # mixer using ToneSoundResource (square / noise / sine, with
+    # per-voice phase and instant_freq exposed for chord locking and
+    # arpeggios respectively — engine 1.11 additions).
+    try:
+        try:
+            import os as _os
+            _os.stat(game_dir + "/polysynth.py")
+            _has_polysynth = True
+        except OSError:
+            _has_polysynth = False
+        if _has_polysynth:
+            try:
+                import polysynth as _ps_mod
+                sys.modules['polysynth'] = _ps_mod
+            except Exception as _ps_e:
+                _write_last_error("polysynth shim install failed:\n", _ps_e)
+    except Exception as _ps_outer:
+        _write_last_error("polysynth detection failed:\n", _ps_outer)
+
     # Legacy original-Thumby games (the ones we found via the
     # <dirname>.py filename fallback) often read buttons via raw
     # `machine.Pin(N, Pin.IN, Pin.PULL_UP).value` with original-Thumby
