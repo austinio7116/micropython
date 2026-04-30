@@ -105,6 +105,26 @@ def _run_active_game():
         _write_last_error("thumbyGrayscale import failed:\n", _gs_e)
         _gs_mod = None
 
+    # Same defensive ordering for polysynth — pre-import our frozen
+    # software-emulated polysynth.py BEFORE adding game_dir to
+    # sys.path. Otherwise a game folder containing its own
+    # polysynth.py (PSdemo / TinyFreddy ship one) wins the search,
+    # the upstream PIO-driven library gets imported, and its
+    # configure() tries to claim GPIOs 7-25 — which on Color are
+    # the LCD backlight, RGB LED PWMs, and A/B/RB buttons. The
+    # outcome on the v1.10/v1.11 build was an ENOMEM at the first
+    # PIO StateMachine allocation. Pre-importing populates
+    # sys.modules['polysynth'] with our shim before sys.path moves,
+    # so a subsequent `import polysynth` from the game short-
+    # circuits to the cache and never reads the bundled file.
+    _ps_mod = None
+    try:
+        import polysynth as _ps_mod
+        sys.modules['polysynth'] = _ps_mod
+    except Exception as _ps_e:
+        _write_last_error("polysynth pre-import failed:\n", _ps_e)
+        _ps_mod = None
+
     # Add game dir to sys.path for `import` inside the game.
     if game_dir not in sys.path:
         sys.path.insert(0, game_dir)
@@ -182,21 +202,15 @@ def _run_active_game():
     # mixer using ToneSoundResource (square / noise / sine, with
     # per-voice phase and instant_freq exposed for chord locking and
     # arpeggios respectively — engine 1.11 additions).
-    try:
-        try:
-            import os as _os
-            _os.stat(game_dir + "/polysynth.py")
-            _has_polysynth = True
-        except OSError:
-            _has_polysynth = False
-        if _has_polysynth:
-            try:
-                import polysynth as _ps_mod
-                sys.modules['polysynth'] = _ps_mod
-            except Exception as _ps_e:
-                _write_last_error("polysynth shim install failed:\n", _ps_e)
-    except Exception as _ps_outer:
-        _write_last_error("polysynth detection failed:\n", _ps_outer)
+    # _ps_mod was pre-imported above; sys.modules['polysynth']
+    # already points at our shim. The bundled polysynth.py in
+    # PSdemo/TinyFreddy never gets parsed because the cache short-
+    # circuits the import. Detection here is a no-op safety check —
+    # if for any reason _ps_mod failed to import earlier (frozen
+    # module missing?), make sure sys.modules is set so the game's
+    # bundled file still doesn't run.
+    if _ps_mod is not None:
+        sys.modules['polysynth'] = _ps_mod
 
     # Legacy original-Thumby games (the ones we found via the
     # <dirname>.py filename fallback) often read buttons via raw
@@ -454,10 +468,40 @@ def _run_active_game():
                     # No real link-cable hardware to talk to anyway.
                     return _LegacyUart()
 
+            # Capture engine module ref for the freq hijack below.
+            try:
+                import engine as _eng_for_freq
+            except Exception:
+                _eng_for_freq = None
+
+            def _machine_freq_via_engine(*args):
+                """Route machine.freq(hz) through engine.freq(hz) so the
+                engine's audio mixer's PWM-IRQ wrap value gets re-
+                computed for the new clock. The default machine.freq
+                in the rp2 port just calls set_sys_clock_khz, which
+                changes clk_sys but doesn't tell engine_audio — the
+                audio IRQ then keeps firing at the (now wrong) old
+                rate. PSdemo's `machine.freq(125_000_000)` triggers
+                exactly this: clock drops, IRQ rate drops with it,
+                every audio sample takes longer than expected, and
+                playback comes out one octave low. Routing through
+                engine.freq() restores the IRQ wrap so audio stays
+                pinned to 22050 Hz regardless of clock changes."""
+                if _eng_for_freq is not None and len(args) == 1:
+                    try:
+                        _eng_for_freq.freq(args[0])
+                        return None
+                    except Exception:
+                        # Fall through to the raw path below if
+                        # engine.freq fails for any reason.
+                        pass
+                return _real_machine.freq(*args)
+
             class _MachineShim:
                 Pin = _PinShim
                 PWM = _PwmShim
                 UART = _UartShim if _real_uart_class is not None else None
+                freq = staticmethod(_machine_freq_via_engine)
                 def __getattr__(self, name):
                     return getattr(_real_machine, name)
             sys.modules['machine'] = _MachineShim()
