@@ -24,12 +24,20 @@
  *                           can see full filenames dropped from a
  *                           host.
  *
- *   FF_CODE_PAGE = 932      Matches what ThumbyNES has been shipping
- *                           (upstream default). 437 would save
- *                           flash via smaller ffunicode tables but
- *                           changing it without isolated test risks
- *                           regressions in NES's ROM picker. Revisit
- *                           as a size optimisation later.
+ *   FF_CODE_PAGE = 437      US-ASCII codepage. Was 932 (Japanese)
+ *                           which dragged in two 29 KB unicode
+ *                           lookup tables (`uni2oem932` +
+ *                           `oem2uni932` = 58 KB combined) into
+ *                           every slot's flash. The 437 tables are
+ *                           tiny by comparison. Filename display in
+ *                           pickers is now ASCII-only — if a user
+ *                           drops a ROM whose filename has Japanese
+ *                           characters those become "?" placeholder
+ *                           glyphs, but the file itself still
+ *                           opens. Trade made for ThumbyOne 1.11
+ *                           specifically to free flash for the GBC
+ *                           cart-RTC integration in the NES slot
+ *                           without growing its 2 MB partition.
  *
  *   FF_FS_EXFAT = 0         FAT16 only. Our canonical format is
  *                           FAT16 with 1 KB clusters — exFAT would
@@ -73,7 +81,7 @@
 / Locale and Namespace Configurations
 /---------------------------------------------------------------------------*/
 
-#define FF_CODE_PAGE    932
+#define FF_CODE_PAGE    437
 
 #define FF_USE_LFN      1
 #define FF_MAX_LFN      255
