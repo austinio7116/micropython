@@ -663,26 +663,17 @@ if (THUMBYONE_SLOT_MODE)
             THUMBYONE_FW_VERSION="${THUMBYONE_FW_VERSION}")
     endif()
 
-    # Override the Tiny Game Engine's flash resource scratch region
-    # so it stays inside the MPY partition instead of clobbering the
-    # sibling slots. Layout depends on THUMBYONE_WITH_MD:
-    #   MD off: MPY = 0x420000..0x620000 (2 MiB)  → scratch base 0x560000
-    #   MD on:  MPY = 0x520000..0x720000 (2 MiB)  → scratch base 0x660000
-    # Either way we reserve the upper 768 KiB of the MPY partition for
-    # engine resource scratch, leaving 1.25 MiB for firmware growth.
-    # PICO_FLASH_SIZE_BYTES is the whole chip, so the engine's default
-    # formula (END_OF_CHIP - FAT_SIZE) does not work here.
-    if (THUMBYONE_WITH_MD)
-        target_compile_definitions(${MICROPY_TARGET} PRIVATE
-            FLASH_RESOURCE_SPACE_BASE=0x660000u
-            FLASH_RESOURCE_SPACE_SIZE=0xC0000u
-        )
-    else()
-        target_compile_definitions(${MICROPY_TARGET} PRIVATE
-            FLASH_RESOURCE_SPACE_BASE=0x560000u
-            FLASH_RESOURCE_SPACE_SIZE=0xC0000u
-        )
-    endif()
+    # The Tiny Game Engine's flash resource scratch region (non-in_ram
+    # TextureResource etc.) is NO LONGER hardcoded here.  It is derived
+    # from the canonical layout in slot_layout.h
+    # (THUMBYONE_MPY_SCRATCH_OFFSET / THUMBYONE_MPY_SCRATCH_SIZE) by
+    # engine_resource_manager.c under THUMBYONE_SLOT_MODE.  The old
+    # hardcoded 0x660000/768KB constant here assumed a 2 MiB MPY slot;
+    # after MPY was rightsized to 1280 KB it fell OUTSIDE the partition
+    # and silently corrupted the SCUMM/CRAFT slot images.  Deriving from
+    # slot_layout.h makes it impossible to drift from the partition
+    # bounds again (slot_layout.h is force-included via mpconfigboard.h,
+    # so the macros are in scope when the engine source compiles).
 
     # /system/ ROM VFS — pack the engine's filesystem/system/ tree
     # into a C blob + entry table at build time, then compile it

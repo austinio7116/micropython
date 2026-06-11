@@ -53,6 +53,88 @@ def _write_last_error(prefix, e):
         pass
 
 
+def _wrap_text(s, width):
+    """Word-wrap a string to `width` characters per line, preserving any
+    existing newlines and hard-breaking over-long words."""
+    out = []
+    for para in s.split("\n"):
+        line = ""
+        for word in para.split(" "):
+            while len(word) > width:
+                if line:
+                    out.append(line)
+                    line = ""
+                out.append(word[:width])
+                word = word[width:]
+            if not line:
+                line = word
+            elif len(line) + 1 + len(word) <= width:
+                line += " " + word
+            else:
+                out.append(line)
+                line = word
+        out.append(line)
+    return "\n".join(out)
+
+
+def _show_crash_screen(e):
+    """Draw the game's error on screen and wait for A before returning to
+    the picker. Best-effort: the crash file has already been written, so
+    if anything here fails we just fall through to the reboot."""
+    try:
+        import engine
+        import engine_io
+        import engine_draw
+        from engine_nodes import CameraNode, Text2DNode
+        from engine_resources import FontResource
+        from engine_math import Vector2
+
+        # Tear down the crashed game's scene + audio first — otherwise its
+        # leftover nodes keep ticking/drawing under the crash screen (the
+        # "game carries on" behaviour) and may re-raise.
+        try:
+            engine.clear_scene()
+        except Exception:
+            pass
+        try:
+            import engine_audio
+            for _ch in range(4):
+                engine_audio.stop(_ch)
+        except Exception:
+            pass
+
+        try:
+            title_text = e.__class__.__name__
+        except Exception:
+            title_text = "Error"
+        body_text = _wrap_text(str(e) or repr(e), 21)
+
+        engine.fps_limit(60)
+        engine_draw.set_background_color(engine_draw.Color(0.06, 0.0, 0.0))
+        font = FontResource("/system/assets/font5x7.bmp")
+        camera = CameraNode()
+        title = Text2DNode(font=font, text=title_text, color=engine_draw.red,
+                           position=Vector2(0, -52), letter_spacing=1)
+        body = Text2DNode(font=font, text=body_text, color=engine_draw.white,
+                          position=Vector2(0, 0), letter_spacing=1, line_spacing=2)
+        hint = Text2DNode(font=font, text="Press A", color=engine_draw.yellow,
+                          position=Vector2(0, 56), letter_spacing=1)
+        camera.add_child(title)
+        camera.add_child(body)
+        camera.add_child(hint)
+
+        # Wait for A to be released first (in case it was held at the
+        # crash), then for a fresh press, so we don't dismiss instantly.
+        while True:
+            if engine.tick() and not engine_io.A.is_pressed:
+                break
+        while True:
+            if engine.tick() and engine_io.A.is_just_pressed:
+                break
+    except Exception:
+        pass
+
+
 def _run_active_game():
     try:
         with open("/.active_game") as f:
@@ -539,9 +621,12 @@ def _run_active_game():
     try:
         exec(code, g)
     except Exception as e:
-        # Game crashed — capture the traceback to /.last_error.txt
-        # so the user can inspect it via USB MSC after reboot.
+        # Game crashed — capture the traceback to /.last_error.txt first
+        # (inspectable via USB MSC), THEN show it on screen and wait for a
+        # button so the player sees what happened before we reboot to the
+        # picker (otherwise it just silently kicks back).
         _write_last_error("Game crash: " + main_path + "\n", e)
+        _show_crash_screen(e)
     finally:
         if original_cwd is not None:
             try:
