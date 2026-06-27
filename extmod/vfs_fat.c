@@ -69,21 +69,25 @@
  * boot_filesystem() so the shared FAT at physical 0x660000
  * interops byte-identically across all four slots.
  *
- * Shape: FAT16, 1 KB clusters, single-FAT, MBR-partitioned.
+ * Shape: FAT12, 4 KB clusters, single-FAT, MBR-partitioned.
  *
- *   fmt = FM_FAT      — FAT16 (no FAT32, no exFAT, no FM_SFD).
+ *   fmt = FM_FAT      — FAT12/16 auto (no FAT32, no exFAT, no FM_SFD).
  *                       WITHOUT FM_SFD an MBR partition table
  *                       lives at sector 0 and the FAT volume at
  *                       the partition start. Windows treats the
- *                       9.6 MB volume as a standard removable
- *                       drive when it sees the MBR; SFD (no MBR)
- *                       can trigger "the drive is not formatted"
- *                       prompts on some Windows versions.
- *   n_fat = 1         — one FAT copy; saves 18 KB on a 9.6 MB
- *                       volume. Redundancy isn't worth much on
- *                       flash that's backed by FatFs's own cache.
- *   au_size = 1024    — 1 KB clusters → 9600 clusters, above the
- *                       FAT12 4084 cap, well below FAT16's 65524.
+ *                       volume as a standard removable drive when
+ *                       it sees the MBR; SFD (no MBR) can trigger
+ *                       "the drive is not formatted" prompts on
+ *                       some Windows versions.
+ *   n_fat = 1         — one FAT copy; redundancy isn't worth much
+ *                       on flash that's backed by FatFs's own cache.
+ *   au_size = 4096    — 4 KB clusters. Required for ThumbyOne's Mote
+ *                       slot, which XIP-executes .mote modules from the
+ *                       FAT via QMI ATRANS (4 KB-granular pages), so a
+ *                       module's first cluster must be 4 KB-aligned. At
+ *                       4 KB every FAT size stays under FAT12's 4084
+ *                       cap → FAT12. (FAT12 on a >8 MB removable mounts
+ *                       fine on Windows — verified on a 13 MB volume.)
  *
  * The lobby's own mkfs path (when we add lobby-owned formatting)
  * will reference this same struct. */
@@ -92,7 +96,7 @@ static const MKFS_PARM mkfs_default_opt = {
     .n_fat = 1,
     .align = 0,
     .n_root = 0,
-    .au_size = 1024,
+    .au_size = 4096,
 };
 
 /* ThumbyOne: reject second mount attempt. Called by make_new and
