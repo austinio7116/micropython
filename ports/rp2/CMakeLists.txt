@@ -631,11 +631,24 @@ if (THUMBYONE_SLOT_MODE)
         message(FATAL_ERROR "THUMBYONE_SLOT_MODE set but THUMBYONE_ROOT missing — "
                             "the parent ThumbyOne build must pass -DTHUMBYONE_ROOT=/path/to/ThumbyOne")
     endif()
+    # Turn every layout-affecting WITH_* flag the parent ThumbyOne build
+    # passed (via ExternalProject CMAKE_ARGS -> cache vars) into a compile
+    # definition, so slot_layout.h — force-included through mpconfigboard.h —
+    # computes the SAME THUMBYONE_FAT_OFFSET as the lobby. Forwarding only
+    # WITH_MD (as before) left the picker mounting the shared FAT at the
+    # wrong offset on any preset whose DOOM/CRAFT/... differ from
+    # slot_layout.h's compile defaults ("FS ERR mount failed"). Vars not
+    # passed are skipped so slot_layout.h's own default still applies.
+    set(_thumbyone_layout_defs "")
+    foreach(_f NES P8 DOOM MPY SCUMM CRAFT ROGUE ELITE ROGUE9 MOTE MD PCE)
+        if (DEFINED THUMBYONE_WITH_${_f})
+            list(APPEND _thumbyone_layout_defs
+                 THUMBYONE_WITH_${_f}=${THUMBYONE_WITH_${_f}})
+        endif()
+    endforeach()
     target_compile_definitions(${MICROPY_TARGET} PRIVATE
         THUMBYONE_SLOT_MODE=1
-        # Propagate WITH_MD so mpconfigboard.h picks the right FAT
-        # base + size (0x660000/9.6MB vs 0x760000/8.6MB).
-        THUMBYONE_WITH_MD=${THUMBYONE_WITH_MD}
+        ${_thumbyone_layout_defs}
         # Lobby owns USB in ThumbyOne. The MPY slot never enumerates
         # — no MSC, no CDC REPL. This saves ~8-10 KB of SRAM that
         # tinyUSB's device stack would otherwise claim, and guarantees
